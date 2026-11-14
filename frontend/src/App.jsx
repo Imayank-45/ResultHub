@@ -50,6 +50,8 @@ export const PROGRAM_OPTIONS = [
   "Ph.D."
 ];
 
+const REQUIRED_IMPORT_COLS = ['ENROLLMENT', 'NAME', 'RESULT'];
+
 export const PROGRAM_MAX_SEMESTER = {
   "B.Tech.": 8,
   "B.E.": 8,
@@ -603,8 +605,29 @@ function DataValidationReportWidget({ report }) {
   );
 }
 
+const createEmptyScrapeJobState = (ownerId = null) => ({
+  owner_id: ownerId,
+  job_id: null,
+  status: 'idle',
+  start_time: null,
+  end_time: null,
+  processing_time_seconds: null,
+  total: 0,
+  processed: 0,
+  pass_count: 0,
+  fail_count: 0,
+  not_found_count: 0,
+  error_count: 0,
+  current_enrollment: '',
+  excel_file_path: null,
+  captcha_mode: 'ocr',
+  records: [],
+  logs: [],
+  validation_report: null,
+});
+
 function MainApp() {
-  const { user, loading, isAuthenticated, logout, authFetch } = useAuth();
+  const { user, token, loading, isAuthenticated, logout, authFetch } = useAuth();
   const { success, error, warning, info } = useToast();
 
   // Active view state: 'dashboard', 'studio', 'profile'
@@ -636,20 +659,14 @@ function MainApp() {
   }, [program]);
 
   // Scrape job state
-  const [jobState, setJobState] = useState({
-    status: 'idle',
-    total: 0,
-    processed: 0,
-    pass_count: 0,
-    fail_count: 0,
-    not_found_count: 0,
-    error_count: 0,
-    current_enrollment: '',
-    excel_file_path: null,
-    captcha_mode: 'ocr',
-    records: [],
-    logs: []
-  });
+  const [jobState, setJobState] = useState(() => createEmptyScrapeJobState(user?.id ?? null));
+  const [jobError, setJobError] = useState('');
+  const [statusRetryCount, setStatusRetryCount] = useState(0);
+  const currentUserIdRef = useRef(user?.id ?? null);
+  const jobStateRef = useRef(jobState);
+  currentUserIdRef.current = user?.id ?? null;
+  jobStateRef.current = jobState;
+  const lastUserIdRef = useRef(user?.id ?? null);
 
   const captchaModeLabel = {
     ocr: '🟢 OCR Mode',
@@ -921,24 +938,29 @@ function MainApp() {
   }, [theme]);
 
   // Safe state merger to prevent crashes from missing fields and auto-sync form inputs
-  const mergeStatus = (newData) => {
-    if (!newData) return;
-    setJobState(prev => ({
-      status: newData.status || 'idle',
-      job_id: newData.job_id ?? prev.job_id ?? null,
-      start_time: newData.start_time ?? prev.start_time ?? null,
-      total: newData.total ?? prev.total ?? 0,
-      processed: newData.processed ?? prev.processed ?? 0,
-      pass_count: newData.pass_count ?? prev.pass_count ?? 0,
-      fail_count: newData.fail_count ?? prev.fail_count ?? 0,
-      not_found_count: newData.not_found_count ?? prev.not_found_count ?? 0,
-      error_count: newData.error_count ?? prev.error_count ?? 0,
-      current_enrollment: newData.current_enrollment ?? prev.current_enrollment ?? '',
-      excel_file_path: newData.excel_file_path ?? prev.excel_file_path ?? null,
-      captcha_mode: newData.captcha_mode ?? prev.captcha_mode ?? 'ocr',
-      records: newData.records ?? prev.records ?? [],
-      logs: newData.logs ?? prev.logs ?? []
-    }));
+  const mergeStatus = (newData, expectedUserId = user?.id ?? null, expectedJobId = null) => {
+    if (!newData || expectedUserId == null || Number(currentUserIdRef.current) !== Number(expectedUserId)) return;
+    if (expectedJobId && newData.job_id !== expectedJobId) return;
+
+    const currentState = jobStateRef.current;
+    if (
+      expectedJobId && currentState.owner_id === expectedUserId && currentState.job_id &&
+      currentState.job_id !== expectedJobId && currentState.status !== 'starting'
+    ) return;
+    if (
+      !expectedJobId && currentState.owner_id === expectedUserId && currentState.job_id &&
+      newData.job_id && currentState.job_id !== newData.job_id
+    ) return;
+
+    setJobState({
+      ...createEmptyScrapeJobState(expectedUserId),
+      ...newData,
+      owner_id: expectedUserId,
+      job_id: newData.job_id ?? expectedJobId ?? null,
+      records: Array.isArray(newData.records) ? newData.records : [],
+      logs: Array.isArray(newData.logs) ? newData.logs : [],
+    });
+    setJobError('');
 
     // Instantly sync Extractor panel form parameters from live single-source-of-truth backend status
     if (newData.prefix) setPrefix(newData.prefix);
@@ -949,41 +971,106 @@ function MainApp() {
     if (newData.program) setProgram(newData.program);
   };
 
-  // Fallback polling interval: 1s when job is active, 2.5s heartbeat when idle
   useEffect(() => {
-    if (!isAuthenticated) return;
+    const userId = user?.id ?? null;
+    if (lastUserIdRef.current !== userId || !isAuthenticated) {
+      lastUserIdRef.current = userId;
+      setJobState(createEmptyScrapeJobState(isAuthenticated ? userId : null));
+      setJobError('');
+      setSelectedRecord(null);
+      setFilterEnrollment('');
+      setFilterName('');
+      setFilterResult('ALL');
+      setImportFile(null);
+      setImportStatus('idle');
+      setImportInfo(null);
+      setImportError('');
+      setImportEndRoll('');
+    }
+  }, [user?.id, isAuthenticated]);
+
+  // Poll the authenticated user's latest job once, then track that job by ID.
+  useEffect(() => {
+    const ownerId = user?.id ?? null;
+    if (!isAuthenticated || ownerId == null) return;
+    const jobId = jobState.owner_id === ownerId ? jobState.job_id : null;
     const isJobActive = jobState.status === 'running' || jobState.status === 'resumed' || jobState.status === 'starting';
-    const pollIntervalMs = isJobActive ? 1000 : 2500;
+    const pollIntervalMs = isJobActive ? 1000 : (jobId ? 10000 : 2500);
+    let disposed = false;
+    let inFlight = false;
+    let controller;
 
-    const interval = setInterval(() => {
-      authFetch(`${API_BASE}/scrape/status`)
-        .then(res => res.ok ? res.json() : null)
-        .then(data => {
-          if (data && data.status) {
-            mergeStatus(data);
-          }
-        })
-        .catch(() => {});
-    }, pollIntervalMs);
+    const pollStatus = async () => {
+      if (disposed || inFlight) return;
+      if (!jobId && jobStateRef.current.status === 'starting') return;
+      inFlight = true;
+      controller = new AbortController();
+      const query = jobId ? `?job_id=${encodeURIComponent(jobId)}` : '';
+      try {
+        const response = await authFetch(`${API_BASE}/scrape/status${query}`, { signal: controller.signal });
+        if (disposed || Number(currentUserIdRef.current) !== Number(ownerId)) return;
+        if (response.status === 404 && jobId) {
+          setJobError('This scraping job is no longer available. Refresh your job list to continue.');
+          return;
+        }
+        if (response.status === 403) {
+          setJobError('You no longer have access to this scraping job.');
+          return;
+        }
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!disposed) mergeStatus(data, ownerId, jobId);
+      } catch (requestError) {
+        if (!disposed && requestError.name !== 'AbortError' && Number(currentUserIdRef.current) === Number(ownerId)) {
+          setJobError('Connection interrupted. Retrying job status automatically.');
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
 
-    return () => clearInterval(interval);
-  }, [isAuthenticated, authFetch, jobState.status]);
+    pollStatus();
+    const interval = setInterval(pollStatus, pollIntervalMs);
 
-  // Connect to WebSocket and sync status on load
+    return () => {
+      disposed = true;
+      if (interval) clearInterval(interval);
+      controller?.abort();
+    };
+  }, [isAuthenticated, authFetch, user?.id, jobState.owner_id, jobState.status, jobState.job_id, statusRetryCount]);
+
+  // Subscribe only after an owned job ID is known; polling supplies the initial status.
   useEffect(() => {
-    if (!isAuthenticated) return;
+    const ownerId = user?.id ?? null;
+    const jobId = jobState.owner_id === ownerId ? jobState.job_id : null;
+    if (!isAuthenticated || ownerId == null || !jobId) return;
 
     let socket;
+    let reconnectTimer;
+    let disposed = false;
+    let reconnectDelay = 1000;
+    const seenLogEvents = new Set();
     const connectWebSocket = () => {
-      socket = new WebSocket(WS_URL);
+      if (disposed || Number(currentUserIdRef.current) !== Number(ownerId)) return;
+      const query = `?job_id=${encodeURIComponent(jobId)}`;
+      socket = new WebSocket(`${WS_URL}${query}`, ['resultai', token]);
 
       socket.onmessage = (event) => {
+        if (disposed || Number(currentUserIdRef.current) !== Number(ownerId)) return;
         try {
           const msg = JSON.parse(event.data);
+          const eventJobId = msg.job_id || msg.data?.job_id;
+          if (msg.user_id !== undefined && Number(msg.user_id) !== Number(ownerId)) return;
+          if (eventJobId !== jobId) return;
           if (msg.type === "status") {
-            mergeStatus(msg.data);
+            mergeStatus(msg.data, ownerId, jobId);
           } else if (msg.type === "log") {
+            const logKey = `${eventJobId}:${msg.message}`;
+            if (seenLogEvents.has(logKey)) return;
+            seenLogEvents.add(logKey);
+            if (seenLogEvents.size > 500) seenLogEvents.delete(seenLogEvents.values().next().value);
             setJobState(prev => {
+              if (Number(currentUserIdRef.current) !== Number(ownerId) || prev.job_id !== jobId) return prev;
               const updatedLogs = [...prev.logs, msg.message];
               if (updatedLogs.length > 500) updatedLogs.shift();
               return { ...prev, logs: updatedLogs };
@@ -994,8 +1081,29 @@ function MainApp() {
         }
       };
 
-      socket.onclose = () => {
-        setTimeout(connectWebSocket, 2000);
+      socket.onopen = () => {
+        reconnectDelay = 1000;
+        authFetch(`${API_BASE}/scrape/status?job_id=${encodeURIComponent(jobId)}`)
+          .then(async (response) => {
+            if (!response.ok) return;
+            const data = await response.json();
+            if (!disposed) mergeStatus(data, ownerId, jobId);
+          })
+          .catch(() => {});
+      };
+
+      socket.onclose = (event) => {
+        if (event.code === 4404) {
+          if (!disposed && Number(currentUserIdRef.current) === Number(ownerId)) {
+            setJobError('This scraping job is no longer available to this account.');
+          }
+          return;
+        }
+        if (!disposed && Number(currentUserIdRef.current) === Number(ownerId)) {
+          setJobError('Live updates disconnected. Job status will continue refreshing.');
+          reconnectTimer = setTimeout(connectWebSocket, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+        }
       };
 
       socket.onerror = (err) => {
@@ -1005,46 +1113,26 @@ function MainApp() {
 
     connectWebSocket();
 
-    // Fetch initial status via HTTP
-    authFetch(`${API_BASE}/scrape/status`)
-      .then(res => {
-        if (!res.ok) throw new Error("Server not responding");
-        return res.json();
-      })
-      .then(data => {
-        if (data && data.status) {
-          mergeStatus(data);
-        }
-      })
-      .catch(err => console.error("Initial load fetch failed:", err));
-
     return () => {
+      disposed = true;
+      clearTimeout(reconnectTimer);
       if (socket) socket.close();
     };
-  }, [isAuthenticated, authFetch]);
+  }, [isAuthenticated, authFetch, token, user?.id, jobState.owner_id, jobState.job_id]);
 
   // Actions
   const handleReset = async () => {
+    const ownerId = user?.id ?? null;
     try {
-      const response = await authFetch(`${API_BASE}/scrape/reset`, { method: 'POST' });
+      const query = jobState.job_id ? `?job_id=${encodeURIComponent(jobState.job_id)}` : '';
+      const response = await authFetch(`${API_BASE}/scrape/reset${query}`, { method: 'POST' });
       const data = await response.json();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       if (!response.ok) {
         error(data.detail || "Failed to reset scrape session");
       } else {
-        setJobState({
-          status: 'idle',
-          total: 0,
-          processed: 0,
-          pass_count: 0,
-          fail_count: 0,
-          not_found_count: 0,
-          error_count: 0,
-          current_enrollment: '',
-          excel_file_path: null,
-          captcha_mode: 'ocr',
-          records: [],
-          logs: []
-        });
+        setJobState(createEmptyScrapeJobState(ownerId));
+        setJobError('');
         setFilterEnrollment('');
         setFilterName('');
         setFilterResult('ALL');
@@ -1052,25 +1140,10 @@ function MainApp() {
         info("Scrape session reset. Ready for new extraction.");
       }
     } catch (err) {
-      setJobState({
-        status: 'idle',
-        total: 0,
-        processed: 0,
-        pass_count: 0,
-        fail_count: 0,
-        not_found_count: 0,
-        error_count: 0,
-        current_enrollment: '',
-        excel_file_path: null,
-        captcha_mode: 'ocr',
-        records: [],
-        logs: []
-      });
-      setFilterEnrollment('');
-      setFilterName('');
-      setFilterResult('ALL');
-      setSelectedRecord(null);
-      info("Scrape session reset locally.");
+      if (Number(currentUserIdRef.current) === Number(ownerId)) {
+        setJobError('Could not reset the job because the server is unreachable.');
+        error(err.message || 'Could not reset scraping job.');
+      }
     }
   };
 
@@ -1081,23 +1154,9 @@ function MainApp() {
       return;
     }
 
-    // Pre-flight state reset when starting a new job from a completed/cancelled/failed state
-    if (jobState.status !== 'idle') {
-      setJobState({
-        status: 'starting',
-        total: 0,
-        processed: 0,
-        pass_count: 0,
-        fail_count: 0,
-        not_found_count: 0,
-        error_count: 0,
-        current_enrollment: '',
-        excel_file_path: null,
-        captcha_mode: 'ocr',
-        records: [],
-        logs: []
-      });
-    }
+    const ownerId = user?.id ?? null;
+    setJobError('');
+    setJobState({ ...createEmptyScrapeJobState(ownerId), status: 'starting' });
 
     const payload = {
       prefix,
@@ -1117,21 +1176,31 @@ function MainApp() {
         body: JSON.stringify(payload)
       });
       const data = await response.json();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       if (!response.ok) {
+        setJobState(createEmptyScrapeJobState(ownerId));
         error(data.detail || "Failed to start job");
       } else {
-        mergeStatus(data.job);
+        mergeStatus(data.job, ownerId, data.job?.job_id);
         success(`Result extraction started for ${prefix} (${start} to ${end})`);
       }
     } catch (err) {
-      error("Error contacting server: " + err.message);
+      if (Number(currentUserIdRef.current) === Number(ownerId)) {
+        setJobState(createEmptyScrapeJobState(ownerId));
+        setJobError('Unable to reach the server. Check your connection and retry.');
+        error("Error contacting server: " + err.message);
+      }
     }
   };
 
   const handleCancel = async () => {
     try {
-      const response = await authFetch(`${API_BASE}/scrape/cancel`, { method: 'POST' });
+      if (!jobState.job_id) return;
+      const ownerId = user?.id ?? null;
+      const jobId = jobState.job_id;
+      const response = await authFetch(`${API_BASE}/scrape/cancel?job_id=${encodeURIComponent(jobId)}`, { method: 'POST' });
       const data = await response.json();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       if (!response.ok) {
         error(data.detail || "Failed to cancel job");
       } else {
@@ -1144,8 +1213,12 @@ function MainApp() {
 
   const handlePause = async () => {
     try {
-      const response = await authFetch(`${API_BASE}/scrape/pause`, { method: 'POST' });
+      if (!jobState.job_id) return;
+      const ownerId = user?.id ?? null;
+      const jobId = jobState.job_id;
+      const response = await authFetch(`${API_BASE}/scrape/pause?job_id=${encodeURIComponent(jobId)}`, { method: 'POST' });
       const data = await response.json();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       if (!response.ok) {
         error(data.detail || "Failed to pause job");
       } else {
@@ -1158,8 +1231,12 @@ function MainApp() {
 
   const handleResume = async () => {
     try {
-      const response = await authFetch(`${API_BASE}/scrape/resume`, { method: 'POST' });
+      if (!jobState.job_id) return;
+      const ownerId = user?.id ?? null;
+      const jobId = jobState.job_id;
+      const response = await authFetch(`${API_BASE}/scrape/resume?job_id=${encodeURIComponent(jobId)}`, { method: 'POST' });
       const data = await response.json();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       if (!response.ok) {
         error(data.detail || "Failed to resume job");
       } else {
@@ -1171,17 +1248,29 @@ function MainApp() {
   };
 
   const handleDownload = () => {
-    if (!jobState.excel_file_path) return;
+    if (!jobState.job_id) return;
+    const ownerId = user?.id ?? null;
+    const jobId = jobState.job_id;
     info("Downloading extracted Excel spreadsheet...");
-    const url = `${API_BASE}/scrape/download?path=${encodeURIComponent(jobState.excel_file_path)}`;
-    window.open(url, "_blank");
+    authFetch(`${API_BASE}/scrape/download?job_id=${encodeURIComponent(jobId)}`)
+      .then(async response => {
+        if (!response.ok) throw new Error('Failed to download scrape output.');
+        const blob = await response.blob();
+        if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
+        const url = window.URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `RGPV_Result_${jobId}.xlsx`;
+        anchor.click();
+        window.URL.revokeObjectURL(url);
+      })
+      .catch(err => error(err.message));
   };
 
   // ─── Import Existing Excel Handlers ───
-  const REQUIRED_IMPORT_COLS = ['ENROLLMENT', 'NAME', 'RESULT'];
-
   const handleImportFile = useCallback(async (file) => {
     if (!file) return;
+    const ownerId = user?.id ?? null;
     if (!file.name.endsWith('.xlsx')) {
       setImportStatus('invalid'); setImportError('Only .xlsx Excel files are supported.');
       setImportFile(null); setImportInfo(null); return;
@@ -1203,27 +1292,37 @@ function MainApp() {
       formData.append('file', file);
       const response = await authFetch(`${API_BASE}/scrape/import_excel`, { method: 'POST', body: formData });
       const result = await response.json();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       if (!response.ok) { setImportStatus('invalid'); setImportError(result.detail || 'Server validation failed.'); return; }
       setImportInfo(result); setImportStatus('valid');
       setImportEndRoll(String(result.next_start_roll + 9));
       setPrefix(result.prefix); setPad(String(result.pad));
       success(`Excel imported: ${result.existing_count} records detected. Next roll: ${result.next_start_roll}`);
     } catch (err) { setImportStatus('invalid'); setImportError('Failed to process the file: ' + err.message); }
-  }, [authFetch, success]);
+  }, [authFetch, success, user?.id]);
 
   const handleContinueExtraction = async () => {
     if (!importInfo || importStatus !== 'valid') return;
     const endRoll = parseInt(importEndRoll);
     if (!endRoll || endRoll < importInfo.next_start_roll) { warning(`End roll must be >= ${importInfo.next_start_roll}`); return; }
     setIsContinuing(true);
+    const ownerId = user?.id ?? null;
     try {
       const payload = { prefix: importInfo.prefix, start: importInfo.next_start_roll, end: endRoll, pad: importInfo.pad, sem: sem || null, program, headless: getHeadlessMode(), import_file_path: importInfo.file_path, preloaded_records: importInfo.existing_records, selected_fields: customExportConfig };
-      setJobState({ status: 'starting', total: 0, processed: 0, pass_count: 0, fail_count: 0, not_found_count: 0, error_count: 0, current_enrollment: '', excel_file_path: null, captcha_mode: 'ocr', records: [], logs: [] });
+      setJobState({ ...createEmptyScrapeJobState(ownerId), status: 'starting' });
+      setJobError('');
       const response = await authFetch(`${API_BASE}/scrape/continue`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const data = await response.json();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       if (!response.ok) { error(data.detail || 'Failed to start continue-extraction job.'); setJobState(prev => ({ ...prev, status: 'idle' })); }
-      else { mergeStatus(data.job); success(`Continue extraction started from roll ${importInfo.next_start_roll} to ${endRoll}`); setImportFile(null); setImportStatus('idle'); setImportInfo(null); setImportError(''); setImportEndRoll(''); }
-    } catch (err) { error('Error starting continue job: ' + err.message); }
+      else { mergeStatus(data.job, ownerId, data.job?.job_id); success(`Continue extraction started from roll ${importInfo.next_start_roll} to ${endRoll}`); setImportFile(null); setImportStatus('idle'); setImportInfo(null); setImportError(''); setImportEndRoll(''); }
+    } catch (err) {
+      if (Number(currentUserIdRef.current) === Number(ownerId)) {
+        setJobState(createEmptyScrapeJobState(ownerId));
+        setJobError('Unable to reach the server. Check your connection and retry.');
+        error('Error starting continue job: ' + err.message);
+      }
+    }
     finally { setIsContinuing(false); }
   };
 
@@ -1232,10 +1331,13 @@ function MainApp() {
   const handleImportDragLeave = useCallback(() => setIsDragOver(false), []);
 
   const downloadStudentPDF = async (rec) => {
+    const ownerId = user?.id ?? null;
     try {
-      const response = await fetch(`${API_BASE}/scrape/download_pdf?enrollment=${rec.enrollment}`);
+      const response = await authFetch(`${API_BASE}/scrape/download_pdf?enrollment=${encodeURIComponent(rec.enrollment)}`);
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       if (response.ok) {
         const blob = await response.blob();
+        if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -1249,6 +1351,8 @@ function MainApp() {
     } catch (e) {
       console.error("Failed to fetch real PDF", e);
     }
+
+    if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
     
     // Fallback to generated PDF if real marksheet was not found (e.g. scraped before this feature was added)
     console.warn("Real marksheet not available. Generating a synthetic PDF instead.");
@@ -1378,7 +1482,8 @@ function MainApp() {
   };
 
   // Analytics Derived Data
-  const isRunning = jobState.status === 'running' || jobState.status === 'resumed';
+  const isStarting = jobState.status === 'starting';
+  const isRunning = jobState.status === 'running' || jobState.status === 'resumed' || jobState.status === 'starting';
   const isPaused = jobState.status === 'paused';
   const totalGraded = jobState.pass_count + jobState.fail_count;
   const passRate = totalGraded > 0 ? Math.round((jobState.pass_count / totalGraded) * 100) : 0;
@@ -1405,6 +1510,16 @@ function MainApp() {
         icon: '⛔',
         title: 'Scraping Cancelled',
         message: 'The current extraction job was stopped before completion.',
+        accent: 'var(--danger)'
+      };
+    }
+
+    if (jobState.status === 'failed') {
+      return {
+        variant: 'error',
+        icon: '❌',
+        title: 'Scraping Failed',
+        message: 'The extraction could not be completed. Review the job details or retry with the same settings.',
         accent: 'var(--danger)'
       };
     }
@@ -1517,6 +1632,14 @@ function MainApp() {
   // Redirect to Login if unauthenticated
   if (!isAuthenticated) {
     return <LoginPage theme={theme} onToggleTheme={toggleTheme} />;
+  }
+
+  if (jobState.owner_id !== user?.id) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
+        Loading your scraping workspace…
+      </div>
+    );
   }
 
   const sgpaRanges = {
@@ -2298,6 +2421,7 @@ function MainApp() {
 
       {currentView === 'history' && (
         <HistoryPage
+          key={user?.id}
           onBackToDashboard={() => { setCurrentView('dashboard'); setActiveTab('extractor'); }}
           onRerunJob={(job) => {
             if (job.prefix) setPrefix(job.prefix);
@@ -2504,7 +2628,11 @@ function MainApp() {
                 />
               </div>
 
-              {!isRunning && !isPaused ? (
+              {isStarting ? (
+                <button className="btn btn-primary" type="button" disabled style={{ flex: 1, opacity: 0.7 }}>
+                  Starting extraction…
+                </button>
+              ) : !isRunning && !isPaused ? (
                 <div style={{ display: 'flex', gap: '10px' }}>
                   <motion.button 
                     whileHover={{ scale: 1.02 }}
@@ -2812,6 +2940,14 @@ function MainApp() {
                 <div className="scraping-status-banner__content">
                   <div className="scraping-status-banner__title">{scrapingStatusBanner.title}</div>
                   <div className="scraping-status-banner__message">{scrapingStatusBanner.message}</div>
+                  {jobError && (
+                    <div role="alert" style={{ marginTop: '8px', color: 'var(--danger)', fontSize: '12px' }}>
+                      {jobError}{' '}
+                      <button type="button" className="btn btn-secondary" onClick={() => setStatusRetryCount(count => count + 1)} style={{ width: 'auto', padding: '4px 9px', fontSize: '11px' }}>
+                        Retry
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -3254,7 +3390,7 @@ function MainApp() {
       </AnimatePresence>
 
       <SessionExpiryModal />
-      <SupportAssistant jobState={jobState} />
+      <SupportAssistant key={user?.id} jobState={jobState} />
     </div>
   );
 }

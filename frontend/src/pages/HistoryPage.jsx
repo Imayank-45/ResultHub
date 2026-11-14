@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuth, API_BASE } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
@@ -14,7 +14,6 @@ import {
   FileSpreadsheet,
   Users,
   CheckCircle2,
-  XCircle,
   Clock,
   ChevronLeft,
   ChevronRight,
@@ -32,7 +31,7 @@ function formatDuration(seconds) {
 }
 
 export default function HistoryPage({ onBackToDashboard, onRerunJob }) {
-  const { authFetch } = useAuth();
+  const { authFetch, user } = useAuth();
   const { success, error: toastError, info } = useToast();
 
   const [history, setHistory] = useState([]);
@@ -44,6 +43,7 @@ export default function HistoryPage({ onBackToDashboard, onRerunJob }) {
   });
 
   const [loading, setLoading] = useState(true);
+  const [historyError, setHistoryError] = useState('');
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [sortBy, setSortBy] = useState('newest');
@@ -52,9 +52,21 @@ export default function HistoryPage({ onBackToDashboard, onRerunJob }) {
   const limit = 10;
 
   const [selectedJobDetails, setSelectedJobDetails] = useState(null);
+  const requestIdRef = useRef(0);
+  const currentUserIdRef = useRef(user?.id ?? null);
+  currentUserIdRef.current = user?.id ?? null;
 
   const fetchHistory = useCallback(async () => {
+    const ownerId = user?.id ?? null;
+    const requestId = ++requestIdRef.current;
+    if (ownerId == null) {
+      setHistory([]);
+      setTotalCount(0);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
+    setHistoryError('');
     try {
       const queryParams = new URLSearchParams({
         page: page.toString(),
@@ -65,8 +77,17 @@ export default function HistoryPage({ onBackToDashboard, onRerunJob }) {
       if (statusFilter !== 'ALL') queryParams.append('status', statusFilter);
 
       const res = await authFetch(`${API_BASE}/scrape/history?${queryParams.toString()}`);
-      if (!res.ok) throw new Error("Failed to fetch scraping history.");
+      if (requestId !== requestIdRef.current || Number(currentUserIdRef.current) !== Number(ownerId)) return;
+      if (!res.ok) {
+        const detail = res.status === 401
+          ? 'Your session expired. Sign in again to view scraping history.'
+          : res.status === 403
+            ? 'You do not have access to this scraping history.'
+            : 'Could not load scraping history. Check your connection and retry.';
+        throw new Error(detail);
+      }
       const data = await res.json();
+      if (requestId !== requestIdRef.current || Number(currentUserIdRef.current) !== Number(ownerId)) return;
 
       setHistory(data.history || []);
       setTotalCount(data.total_count || 0);
@@ -74,21 +95,39 @@ export default function HistoryPage({ onBackToDashboard, onRerunJob }) {
         setSummary(data.summary);
       }
     } catch (err) {
+      if (requestId !== requestIdRef.current || Number(currentUserIdRef.current) !== Number(ownerId)) return;
+      setHistory([]);
+      setTotalCount(0);
+      setHistoryError(err.message || 'Error loading history records.');
       toastError(err.message || "Error loading history records.");
     } finally {
-      setLoading(false);
+      if (requestId === requestIdRef.current && Number(currentUserIdRef.current) === Number(ownerId)) setLoading(false);
     }
-  }, [authFetch, page, sortBy, search, statusFilter, toastError]);
+  }, [authFetch, page, sortBy, search, statusFilter, toastError, user?.id]);
 
   useEffect(() => {
     fetchHistory();
+    return () => {
+      requestIdRef.current += 1;
+    };
   }, [fetchHistory]);
+
+  useEffect(() => {
+    setHistory([]);
+    setSummary({ total_jobs: 0, total_students_scraped: 0, avg_pass_rate: 0, total_excel_files: 0 });
+    setTotalCount(0);
+    setSelectedJobDetails(null);
+    setHistoryError('');
+    setPage(1);
+  }, [user?.id]);
 
   const handleDeleteItem = async (id, jobId) => {
     if (!window.confirm(`Are you sure you want to delete history record ${jobId}?`)) return;
+    const ownerId = user?.id;
     try {
       const res = await authFetch(`${API_BASE}/scrape/history/${id}`, { method: 'DELETE' });
       const data = await res.json();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       if (!res.ok) throw new Error(data.detail || "Failed to delete record.");
       success(data.message || `History entry ${jobId} deleted.`);
       fetchHistory();
@@ -99,9 +138,11 @@ export default function HistoryPage({ onBackToDashboard, onRerunJob }) {
 
   const handleClearAll = async () => {
     if (!window.confirm("Are you sure you want to clear ALL extraction history records?")) return;
+    const ownerId = user?.id;
     try {
       const res = await authFetch(`${API_BASE}/scrape/history/clear`, { method: 'DELETE' });
       const data = await res.json();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       if (!res.ok) throw new Error(data.detail || "Failed to clear history.");
       success(data.message || "All extraction history cleared.");
       setPage(1);
@@ -111,11 +152,24 @@ export default function HistoryPage({ onBackToDashboard, onRerunJob }) {
     }
   };
 
-  const handleDownloadExcel = (path) => {
-    if (!path) return;
+  const handleDownloadExcel = async (jobId) => {
+    if (!jobId) return;
+    const ownerId = user?.id;
     info("Downloading Excel spreadsheet...");
-    const url = `${API_BASE}/scrape/download?path=${encodeURIComponent(path)}`;
-    window.open(url, "_blank");
+    try {
+      const res = await authFetch(`${API_BASE}/scrape/download?job_id=${encodeURIComponent(jobId)}`);
+      if (!res.ok) throw new Error('Failed to download Excel spreadsheet.');
+      const blob = await res.blob();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
+      const objectUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = `RGPV_Result_${jobId}.xlsx`;
+      anchor.click();
+      window.URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      toastError(err.message || 'Failed to download Excel spreadsheet.');
+    }
   };
 
   const totalPages = Math.ceil(totalCount / limit) || 1;
@@ -278,6 +332,13 @@ export default function HistoryPage({ onBackToDashboard, onRerunJob }) {
           </div>
         </div>
 
+        {historyError && (
+          <div role="alert" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', padding: '10px 12px', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '8px', color: 'var(--danger)', fontSize: '13px' }}>
+            <span>{historyError}</span>
+            <button type="button" className="btn btn-secondary" onClick={fetchHistory} style={{ width: 'auto', padding: '6px 10px' }}>Retry</button>
+          </div>
+        )}
+
         {/* TABLE DISPLAY */}
         {loading ? (
           <div className="table-wrapper">
@@ -417,7 +478,7 @@ export default function HistoryPage({ onBackToDashboard, onRerunJob }) {
                           {/* Excel Download Button */}
                           {h.excel_file_path && (
                             <button
-                              onClick={() => handleDownloadExcel(h.excel_file_path)}
+                              onClick={() => handleDownloadExcel(h.job_id)}
                               className="btn btn-secondary"
                               title="Download Excel Spreadsheet"
                               style={{ padding: '5px 8px', fontSize: '11.5px', borderRadius: '7px', color: '#10B981', borderColor: 'rgba(16,185,129,0.3)' }}

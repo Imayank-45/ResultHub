@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 
 const isDev = window.location.port === '5173';
 const host = isDev ? '127.0.0.1:8000' : window.location.host;
@@ -7,6 +7,8 @@ export const API_BASE = `${window.location.protocol}//${host}/api`;
 const AuthContext = createContext(null);
 
 export const AuthProvider = ({ children }) => {
+  const authEpochRef = useRef(0);
+  const refreshAuthTokenRef = useRef(null);
   const [token, setToken] = useState(() => {
     return localStorage.getItem('access_token') || sessionStorage.getItem('access_token') || null;
   });
@@ -24,7 +26,8 @@ export const AuthProvider = ({ children }) => {
   const [showExpiryModal, setShowExpiryModal] = useState(false);
 
   // Storage selection helper based on rememberMe flag
-  const saveAuthData = (accessToken, refToken, userData, rememberMe) => {
+  const saveAuthData = (accessToken, refToken, userData, rememberMe, preserveAuthEpoch = false) => {
+    if (!preserveAuthEpoch) authEpochRef.current += 1;
     const storage = rememberMe ? localStorage : sessionStorage;
     // Clear both first to avoid duplicates
     localStorage.removeItem('access_token');
@@ -44,6 +47,7 @@ export const AuthProvider = ({ children }) => {
   };
 
   const clearAuthData = useCallback(() => {
+    authEpochRef.current += 1;
     localStorage.removeItem('access_token');
     localStorage.removeItem('refresh_token');
     localStorage.removeItem('user_data');
@@ -59,6 +63,7 @@ export const AuthProvider = ({ children }) => {
 
   // Authenticated fetch wrapper
   const authFetch = useCallback(async (url, options = {}) => {
+    const requestEpoch = authEpochRef.current;
     const activeToken = token || localStorage.getItem('access_token') || sessionStorage.getItem('access_token');
     
     const headers = {
@@ -73,15 +78,17 @@ export const AuthProvider = ({ children }) => {
 
     // Handle 401 Unauthorized -> attempt token refresh
     if (response.status === 401 && refreshToken) {
+      if (requestEpoch !== authEpochRef.current) return response;
       console.log("Access token expired. Attempting refresh...");
-      const refreshed = await refreshAuthToken();
-      if (refreshed && refreshed.access_token) {
+      const refreshed = await refreshAuthTokenRef.current?.(requestEpoch);
+      const storedToken = localStorage.getItem('access_token') || sessionStorage.getItem('access_token');
+      if (refreshed && refreshed.access_token && authEpochRef.current === requestEpoch && storedToken === refreshed.access_token) {
         headers['Authorization'] = `Bearer ${refreshed.access_token}`;
         response = await fetch(url, { ...options, headers });
-      } else {
-        clearAuthData();
       }
     }
+
+    if (response.status === 401 && requestEpoch === authEpochRef.current) clearAuthData();
 
     return response;
   }, [token, refreshToken, clearAuthData]);
@@ -190,32 +197,33 @@ export const AuthProvider = ({ children }) => {
 
   // Logout handler
   const logout = async () => {
+    const accessToken = token;
+    const refToken = refreshToken || localStorage.getItem('refresh_token') || sessionStorage.getItem('refresh_token');
+    clearAuthData();
+    if (!accessToken) return;
     try {
-      const refToken = refreshToken || localStorage.getItem('refresh_token') || sessionStorage.getItem('refresh_token');
-      if (token) {
-        await authFetch(`${API_BASE}/auth/logout`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ refresh_token: refToken })
-        });
-      }
+      await fetch(`${API_BASE}/auth/logout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({ refresh_token: refToken })
+      });
     } catch (e) {
       console.error("Logout API error:", e);
-    } finally {
-      clearAuthData();
     }
   };
 
   // Logout from all devices
   const logoutAll = async () => {
+    const accessToken = token;
+    clearAuthData();
+    if (!accessToken) return;
     try {
-      if (token) {
-        await authFetch(`${API_BASE}/auth/logout-all`, { method: 'POST' });
-      }
+      await fetch(`${API_BASE}/auth/logout-all`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
     } catch (e) {
       console.error("Logout-all API error:", e);
-    } finally {
-      clearAuthData();
     }
   };
 
@@ -321,7 +329,8 @@ export const AuthProvider = ({ children }) => {
   };
 
   // Refresh token handler
-  const refreshAuthToken = async () => {
+  const refreshAuthToken = async (expectedEpoch = authEpochRef.current) => {
+    if (expectedEpoch !== authEpochRef.current) return null;
     const refToken = refreshToken || localStorage.getItem('refresh_token') || sessionStorage.getItem('refresh_token');
     if (!refToken) return null;
 
@@ -336,27 +345,32 @@ export const AuthProvider = ({ children }) => {
       if (!response.ok) {
         throw new Error(data.detail || 'Failed to refresh token');
       }
+      if (expectedEpoch !== authEpochRef.current) return null;
 
       const isRemembered = !!localStorage.getItem('refresh_token');
-      saveAuthData(data.access_token, data.refresh_token, data.user, isRemembered);
+      saveAuthData(data.access_token, data.refresh_token, data.user, isRemembered, true);
       setShowExpiryModal(false);
       return data;
     } catch (err) {
       console.error("Token refresh failed:", err);
-      clearAuthData();
+      if (expectedEpoch === authEpochRef.current) clearAuthData();
       return null;
     }
   };
+  refreshAuthTokenRef.current = refreshAuthToken;
 
   // Initial session verification on mount
   useEffect(() => {
     const initAuth = async () => {
+      const requestEpoch = authEpochRef.current;
       const activeToken = localStorage.getItem('access_token') || sessionStorage.getItem('access_token');
       if (activeToken) {
         try {
           const res = await authFetch(`${API_BASE}/auth/me`);
+          if (requestEpoch !== authEpochRef.current) return;
           if (res.ok) {
             const meData = await res.json();
+            if (requestEpoch !== authEpochRef.current) return;
             setUser(meData.user);
           } else {
             clearAuthData();

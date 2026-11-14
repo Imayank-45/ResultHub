@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Float, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Float, Index, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from backend.db.database import Base
@@ -78,9 +78,13 @@ class LoginHistory(Base):
 
 class ScrapeJobHistory(Base):
     __tablename__ = "scrape_job_histories"
+    __table_args__ = (
+        Index("ix_scrape_job_histories_user_job", "user_id", "job_id"),
+        Index("ix_scrape_job_histories_user_created", "user_id", "created_at"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     job_id = Column(String(50), index=True, nullable=False)
     prefix = Column(String(50), nullable=False)
     start_roll = Column(Integer, nullable=False)
@@ -101,6 +105,23 @@ class ScrapeJobHistory(Base):
 
     # Relationship to user
     user = relationship("User", back_populates="scrape_histories")
+
+
+class ScrapeJob(Base):
+    __tablename__ = "scrape_jobs"
+    __table_args__ = (
+        Index("ix_scrape_jobs_user_job", "user_id", "job_id"),
+    )
+
+    job_id = Column(String(64), primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(30), nullable=False, index=True)
+    status_json = Column(Text, nullable=False)
+    excel_file_path = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    user = relationship("User")
 
 
 class FileConversionHistory(Base):

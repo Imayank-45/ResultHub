@@ -1,10 +1,12 @@
 # server.py
 import asyncio
+import contextvars
 import io
 import os
 import queue
 import sys
 import threading
+import uuid
 from typing import List, Optional, Any, Dict
 import re
 import json
@@ -36,8 +38,8 @@ from backend.subject_marks_router import router as subject_marks_router
 # Import Database & Auth modules
 from sqlalchemy import text
 from backend.db.database import Base, engine, SessionLocal
-from backend.db.models import User, ScrapeJobHistory
-from backend.db.auth import get_password_hash, get_current_user
+from backend.db.models import User, ScrapeJob, ScrapeJobHistory
+from backend.db.auth import get_password_hash, get_current_user, decode_token, SECRET_KEY
 from backend.auth_router import auth_router
 
 Base.metadata.create_all(bind=engine)
@@ -96,29 +98,30 @@ app.add_middleware(
 
 # Global variables
 update_queue = queue.Queue()
-active_runner: Optional['ScrapeJobRunner'] = None
 runner_lock = threading.Lock()
-last_job_status: Optional[dict] = None
+scrape_runners: Dict[str, 'ScrapeJobRunner'] = {}
 background_tasks = set()
+_current_job_runner = contextvars.ContextVar("current_job_runner", default=None)
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections: Dict[WebSocket, tuple[int, Optional[str]]] = {}
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+    async def connect(self, websocket: WebSocket, user_id: int, job_id: Optional[str]):
+        await websocket.accept(subprotocol="resultai")
+        self.active_connections[websocket] = (user_id, job_id)
 
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+        self.active_connections.pop(websocket, None)
 
-    async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+    async def send_to_owner(self, user_id: int, job_id: str, message: dict):
+        for connection, (connection_user_id, subscribed_job_id) in list(self.active_connections.items()):
+            if connection_user_id != user_id or (subscribed_job_id and subscribed_job_id != job_id):
+                continue
             try:
                 await connection.send_json(message)
             except Exception:
-                pass
+                self.disconnect(connection)
 
 manager = ConnectionManager()
 
@@ -146,13 +149,19 @@ class WebLogger(io.TextIOBase):
         self.original_stdout.flush()
 
 def log_callback(line: str):
-    global active_runner
-    if active_runner:
-        active_runner.logs.append(line)
+    runner = _current_job_runner.get()
+    if runner:
+        runner.logs.append(line)
         # Only keep last 500 logs to conserve memory
-        if len(active_runner.logs) > 500:
-            active_runner.logs.pop(0)
-    update_queue.put({"type": "log", "message": line})
+        if len(runner.logs) > 500:
+            runner.logs.pop(0)
+        if runner.user_id is not None:
+            update_queue.put({
+                "type": "log",
+                "user_id": runner.user_id,
+                "job_id": runner.job_id,
+                "message": line
+            })
 
 # Redirect sys.stdout to our custom logger
 original_stdout = sys.stdout
@@ -160,7 +169,7 @@ sys.stdout = WebLogger(original_stdout, log_callback)
 
 class ScrapeJobRunner:
     def __init__(self, prefix: str, start: int, end: int, pad: int, sem: Optional[str], program: str,
-                 headless: bool = True, user_id: Optional[int] = None,
+                 headless: bool = True, user_id: Optional[int] = None, job_id: Optional[str] = None,
                  continue_mode: bool = False, import_file_path: Optional[str] = None,
                  preloaded_records: Optional[List[Any]] = None,
                  selected_fields: Optional[List[str]] = None):
@@ -173,11 +182,11 @@ class ScrapeJobRunner:
         self.program = program
         self.headless = headless
         self.user_id = user_id
+        self.job_id = job_id or f"JOB-{uuid.uuid4().hex}"
         self.continue_mode = continue_mode
         self.import_file_path = import_file_path
         self.selected_fields = selected_fields
 
-        self.job_id = f"JOB-{int(time.time())}"
         self.start_time = time.time()
         self.status = "running"
         self.total = end - start + 1
@@ -229,10 +238,35 @@ class ScrapeJobRunner:
         self.notify_progress()
 
     def notify_progress(self):
-        update_queue.put({
-            "type": "status",
-            "data": self.get_status_dict()
-        })
+        status = self.get_status_dict()
+        self._persist_status(status)
+        if self.user_id is not None:
+            update_queue.put({
+                "type": "status",
+                "user_id": self.user_id,
+                "job_id": self.job_id,
+                "data": status
+            })
+
+    def _persist_status(self, status: Optional[dict] = None):
+        if self.user_id is None:
+            return
+        db = SessionLocal()
+        try:
+            job = db.query(ScrapeJob).filter(
+                ScrapeJob.job_id == self.job_id,
+                ScrapeJob.user_id == self.user_id
+            ).first()
+            if job:
+                job.status = self.status
+                job.status_json = json.dumps(status or self.get_status_dict(), ensure_ascii=False)
+                job.excel_file_path = self.excel_file_path
+                db.commit()
+        except Exception as exc:
+            db.rollback()
+            print("[System] Job status persistence warning.")
+        finally:
+            db.close()
 
     def get_status_dict(self):
         return {
@@ -267,6 +301,7 @@ class ScrapeJobRunner:
         self.notify_progress()
 
     def _run(self):
+        context_token = _current_job_runner.set(self)
         print(f"\n[System] Running bulk fetch: Prefix={self.prefix}, Range={self.start}-{self.end} (Start Roll={self.current_roll}), Sem={self.sem or 'All'}, Program={self.program}")
         self.notify_progress()
         
@@ -348,13 +383,17 @@ class ScrapeJobRunner:
                         print("[System] ✅ Data Validation Success: No suspicious data detected.")
 
                     print("[System] Compiling results to Excel spreadsheet...")
-                    os.makedirs("data", exist_ok=True)
+                    if self.user_id is not None:
+                        output_dir = user_job_directory(self.user_id, self.job_id)
+                    else:
+                        output_dir = "data"
+                    os.makedirs(output_dir, exist_ok=True)
                     if self.continue_mode and self.import_file_path:
                         # Overwrite the imported file with all records (original + new)
                         out_path = self.import_file_path
                         print(f"[System] Continue mode: appending new records to imported file: {out_path}")
                     else:
-                        out_path = f"data/RGPV_Result_{self.prefix}_{self.start}-{self.end}.xlsx"
+                        out_path = os.path.join(output_dir, f"RGPV_Result_{self.prefix}_{self.start}-{self.end}.xlsx")
                     write_excel(self.records, out_path, selected_fields=self.selected_fields)
                     self.excel_file_path = out_path
                     self.status = "completed"
@@ -362,21 +401,23 @@ class ScrapeJobRunner:
 
         except Exception as e:
             self.status = "failed"
-            print(f"[System] Critical error occurred: {e}")
+            print("[System] Scrape job failed due to an internal error.")
         finally:
             import time
             self.end_time = time.time()
             self.processing_time_seconds = int(self.end_time - self.start_time)
             self.current_enrollment = ""
             self.notify_progress()
-            global last_job_status
-            last_job_status = self.get_status_dict()
+            self._persist_status()
             
             # Save or update job history record in SQLite database
             try:
                 db = SessionLocal()
                 duration = int(time.time() - self.start_time)
-                history = db.query(ScrapeJobHistory).filter(ScrapeJobHistory.job_id == self.job_id).first()
+                history = db.query(ScrapeJobHistory).filter(
+                    ScrapeJobHistory.job_id == self.job_id,
+                    ScrapeJobHistory.user_id == self.user_id
+                ).first()
                 if not history:
                     history = ScrapeJobHistory(
                         job_id=self.job_id,
@@ -411,13 +452,98 @@ class ScrapeJobRunner:
                 db.close()
                 print(f"[System] Scrape job history saved to database (Job ID: {self.job_id}).")
             except Exception as db_err:
-                print(f"[System] History DB save warning: {db_err}")
+                print("[System] Scrape history persistence warning.")
 
-            # Only release runner lock if job is completed, cancelled, or failed
             if self.status in ["completed", "cancelled", "failed"]:
-                global active_runner
                 with runner_lock:
-                    active_runner = None
+                    scrape_runners.pop(self.job_id, None)
+            _current_job_runner.reset(context_token)
+
+
+def user_job_directory(user_id: int, job_id: Optional[str] = None) -> str:
+    user_dir = os.path.join(ROOT_DIR, "data", "users", str(user_id))
+    if job_id:
+        return os.path.join(user_dir, "jobs", job_id)
+    return user_dir
+
+
+def idle_job_status() -> dict:
+    return {
+        "status": "idle",
+        "job_id": None,
+        "total": 0,
+        "processed": 0,
+        "pass_count": 0,
+        "fail_count": 0,
+        "not_found_count": 0,
+        "error_count": 0,
+        "current_enrollment": "",
+        "excel_file_path": None,
+        "validation_report": None,
+        "records": [],
+        "logs": []
+    }
+
+
+def get_owned_job_row(user_id: int, job_id: str, db=None) -> Optional[ScrapeJob]:
+    owns_session = db is None
+    db = db or SessionLocal()
+    try:
+        return db.query(ScrapeJob).filter(
+            ScrapeJob.job_id == job_id,
+            ScrapeJob.user_id == user_id
+        ).first()
+    finally:
+        if owns_session:
+            db.close()
+
+
+def get_user_job_status(user_id: int, job_id: Optional[str] = None) -> dict:
+    db = SessionLocal()
+    try:
+        query = db.query(ScrapeJob).filter(ScrapeJob.user_id == user_id)
+        if job_id:
+            query = query.filter(ScrapeJob.job_id == job_id)
+            job = query.first()
+        else:
+            job = query.order_by(ScrapeJob.created_at.desc()).first()
+        if not job:
+            if job_id:
+                raise HTTPException(status_code=404, detail="Scrape job not found.")
+            return idle_job_status()
+
+        with runner_lock:
+            runner = scrape_runners.get(job.job_id)
+        if runner and runner.user_id == user_id:
+            return runner.get_status_dict()
+        try:
+            return json.loads(job.status_json)
+        except (TypeError, json.JSONDecodeError):
+            return idle_job_status()
+    finally:
+        db.close()
+
+
+def start_user_scrape_job(user_id: int, **runner_args) -> tuple[ScrapeJobRunner, dict]:
+    runner = ScrapeJobRunner(user_id=user_id, job_id=f"JOB-{uuid.uuid4().hex}", **runner_args)
+    status = runner.get_status_dict()
+    db = SessionLocal()
+    try:
+        db.add(ScrapeJob(
+            job_id=runner.job_id,
+            user_id=user_id,
+            status=runner.status,
+            status_json=json.dumps(status, ensure_ascii=False),
+            excel_file_path=runner.excel_file_path
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    with runner_lock:
+        scrape_runners[runner.job_id] = runner
+        runner.start_job()
+    return runner, runner.get_status_dict()
 
 
 # API Schemas
@@ -587,28 +713,20 @@ def record_like(req: LikeRequest = LikeRequest()):
 
 @app.post("/api/scrape/start")
 def start_scraping_job(req: StartJobRequest, current_user: User = Depends(get_current_user)):
-    global active_runner
-    with runner_lock:
-        if active_runner is not None:
-            raise HTTPException(status_code=400, detail="A scraping job is already running.")
-        
-        if req.start > req.end:
-            raise HTTPException(status_code=400, detail="Start roll number must be less than or equal to end roll number.")
-
-        active_runner = ScrapeJobRunner(
-            prefix=req.prefix,
-            start=req.start,
-            end=req.end,
-            pad=req.pad,
-            sem=req.sem,
-            program=req.program,
-            headless=req.headless,
-            user_id=current_user.id,
-            selected_fields=req.selected_fields
-        )
-        active_runner.start_job()
-        
-    return {"message": "Scraping job started successfully.", "job": active_runner.get_status_dict()}
+    if req.start > req.end:
+        raise HTTPException(status_code=400, detail="Start roll number must be less than or equal to end roll number.")
+    _, status = start_user_scrape_job(
+        current_user.id,
+        prefix=req.prefix,
+        start=req.start,
+        end=req.end,
+        pad=req.pad,
+        sem=req.sem,
+        program=req.program,
+        headless=req.headless,
+        selected_fields=req.selected_fields
+    )
+    return {"message": "Scraping job started successfully.", "job": status}
 
 
 @app.post("/api/scrape/custom_export")
@@ -617,8 +735,8 @@ def generate_custom_excel(req: CustomExportRequest, current_user: User = Depends
         raise HTTPException(status_code=400, detail="No records provided for export.")
     
     import time
-    os.makedirs("data", exist_ok=True)
-    out_path = os.path.abspath(f"data/RGPV_Custom_Export_{int(time.time())}.xlsx")
+    os.makedirs(user_job_directory(current_user.id), exist_ok=True)
+    out_path = os.path.join(user_job_directory(current_user.id), f"RGPV_Custom_Export_{int(time.time())}_{uuid.uuid4().hex[:8]}.xlsx")
     write_excel(req.records, out_path, selected_fields=req.selected_fields)
     
     return FileResponse(
@@ -734,9 +852,10 @@ async def import_existing_excel(file: UploadFile = File(...), current_user: User
     next_start_roll = last_roll + 1
 
     # Save file to data/ directory
-    os.makedirs("data", exist_ok=True)
+    import_dir = os.path.join(user_job_directory(current_user.id), "imports")
+    os.makedirs(import_dir, exist_ok=True)
     safe_name = re.sub(r'[^\w\-_.]', '_', file.filename)
-    save_path = os.path.join("data", safe_name)
+    save_path = os.path.join(import_dir, f"{uuid.uuid4().hex}_{safe_name}")
     with open(save_path, "wb") as f:
         f.write(file_bytes)
 
@@ -760,113 +879,95 @@ def continue_scraping_job(req: ContinueJobRequest, current_user: User = Depends(
     and pre-loads existing records from a previously imported Excel.
     On completion, the job overwrites the imported file with all records.
     """
-    global active_runner
-    with runner_lock:
-        if active_runner is not None:
-            raise HTTPException(status_code=400, detail="A scraping job is already running.")
+    if req.start > req.end:
+        raise HTTPException(status_code=400, detail="Start roll must be <= end roll.")
 
-        if req.start > req.end:
-            raise HTTPException(status_code=400, detail="Start roll must be <= end roll.")
+    import_root = os.path.realpath(os.path.join(user_job_directory(current_user.id), "imports"))
+    import_path = os.path.realpath(req.import_file_path)
+    if os.path.commonpath([import_root, import_path]) != import_root or not os.path.isfile(import_path):
+        raise HTTPException(status_code=404, detail="Imported Excel file not found.")
 
-        if not os.path.exists(req.import_file_path):
-            raise HTTPException(status_code=404, detail=f"Imported Excel file not found at: {req.import_file_path}")
-
-        active_runner = ScrapeJobRunner(
-            prefix=req.prefix,
-            start=req.start,
-            end=req.end,
-            pad=req.pad,
-            sem=req.sem,
-            program=req.program,
-            headless=req.headless,
-            user_id=current_user.id,
-            continue_mode=True,
-            import_file_path=req.import_file_path,
-            preloaded_records=req.preloaded_records
-        )
-        active_runner.start_job()
-
-    return {"message": "Continue-extraction job started.", "job": active_runner.get_status_dict()}
+    _, status = start_user_scrape_job(
+        current_user.id,
+        prefix=req.prefix,
+        start=req.start,
+        end=req.end,
+        pad=req.pad,
+        sem=req.sem,
+        program=req.program,
+        headless=req.headless,
+        continue_mode=True,
+        import_file_path=import_path,
+        preloaded_records=req.preloaded_records,
+        selected_fields=req.selected_fields
+    )
+    return {"message": "Continue-extraction job started.", "job": status}
 
 
 @app.post("/api/scrape/cancel")
-def cancel_scraping_job():
-    global active_runner
-    if active_runner is None:
-        return {"message": "No active scraping job is running."}
-    
-    active_runner.cancel()
+def cancel_scraping_job(job_id: str, current_user: User = Depends(get_current_user)):
+    with runner_lock:
+        runner = scrape_runners.get(job_id)
+        if not runner or runner.user_id != current_user.id:
+            raise HTTPException(status_code=404, detail="Scrape job not found.")
+        runner.cancel()
     return {"message": "Job cancellation triggered."}
 
 
 @app.post("/api/scrape/pause")
-def pause_scraping_job(current_user: User = Depends(get_current_user)):
-    global active_runner
-    if active_runner is None:
-        raise HTTPException(status_code=400, detail="No active scraping job is running.")
-    active_runner.pause()
-    return {"message": "Job pause requested.", "job": active_runner.get_status_dict()}
+def pause_scraping_job(job_id: str, current_user: User = Depends(get_current_user)):
+    with runner_lock:
+        runner = scrape_runners.get(job_id)
+        if not runner or runner.user_id != current_user.id:
+            raise HTTPException(status_code=404, detail="Scrape job not found.")
+        runner.pause()
+        return {"message": "Job pause requested.", "job": runner.get_status_dict()}
 
 
 @app.post("/api/scrape/resume")
-def resume_scraping_job(current_user: User = Depends(get_current_user)):
-    global active_runner
-    if active_runner is None:
-        raise HTTPException(status_code=400, detail="No active scraping job to resume.")
-    if active_runner.status != "paused":
-        raise HTTPException(status_code=400, detail="Scrape job is not currently paused.")
-    active_runner.resume()
-    return {"message": "Job resumed.", "job": active_runner.get_status_dict()}
+def resume_scraping_job(job_id: str, current_user: User = Depends(get_current_user)):
+    with runner_lock:
+        runner = scrape_runners.get(job_id)
+        if not runner or runner.user_id != current_user.id:
+            raise HTTPException(status_code=404, detail="Scrape job not found.")
+        if runner.status != "paused":
+            raise HTTPException(status_code=400, detail="Scrape job is not currently paused.")
+        runner.resume()
+        return {"message": "Job resumed.", "job": runner.get_status_dict()}
 
 
 @app.post("/api/scrape/reset")
-def reset_scraping_job(current_user: User = Depends(get_current_user)):
-    global active_runner, last_job_status
-    with runner_lock:
-        if active_runner is not None and active_runner.status in ["running", "resumed"]:
-            raise HTTPException(status_code=400, detail="Cannot reset while a scraping job is actively running. Stop or pause it first.")
-        active_runner = None
-        last_job_status = None
-
-    idle_status = {
-        "status": "idle",
-        "total": 0,
-        "processed": 0,
-        "pass_count": 0,
-        "fail_count": 0,
-        "not_found_count": 0,
-        "error_count": 0,
-        "current_enrollment": "",
-        "excel_file_path": None,
-        "captcha_mode": "ocr",
-        "records": [],
-        "logs": []
-    }
-    update_queue.put({"type": "status", "data": idle_status})
-    return {"message": "Scrape session reset successfully.", "job": idle_status}
+def reset_scraping_job(job_id: Optional[str] = None, current_user: User = Depends(get_current_user)):
+    if not job_id:
+        return {"message": "Scrape session reset successfully.", "job": idle_job_status()}
+    db = SessionLocal()
+    try:
+        job = db.query(ScrapeJob).filter(
+            ScrapeJob.job_id == job_id,
+            ScrapeJob.user_id == current_user.id
+        ).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Scrape job not found.")
+        with runner_lock:
+            runner = scrape_runners.get(job_id)
+            if runner and runner.user_id != current_user.id:
+                raise HTTPException(status_code=404, detail="Scrape job not found.")
+            if runner and runner.status in ["running", "resumed", "starting"]:
+                raise HTTPException(status_code=409, detail="Cannot reset while this job is active. Stop or pause it first.")
+            reset_status = idle_job_status()
+            reset_status["job_id"] = job_id
+            job.status = "idle"
+            job.status_json = json.dumps(reset_status)
+            job.excel_file_path = None
+            db.commit()
+            return {"message": "Scrape session reset successfully.", "job": reset_status}
+    finally:
+        db.close()
 
 
 @app.get("/api/scrape/status")
-def get_scraping_status():
-    global active_runner, last_job_status
-    if active_runner is None:
-        if last_job_status:
-            return last_job_status
-        return {
-            "status": "idle",
-            "total": 0,
-            "processed": 0,
-            "pass_count": 0,
-            "fail_count": 0,
-            "not_found_count": 0,
-            "error_count": 0,
-            "current_enrollment": "",
-            "excel_file_path": None,
-            "validation_report": None,
-            "records": [],
-            "logs": []
-        }
-    return active_runner.get_status_dict()
+def get_scraping_status(job_id: Optional[str] = None, current_user: User = Depends(get_current_user)):
+    return get_user_job_status(current_user.id, job_id)
 
 
 # History API Endpoints
@@ -881,7 +982,7 @@ def get_scraping_history(
 ):
     db = SessionLocal()
     try:
-        query = db.query(ScrapeJobHistory)
+        query = db.query(ScrapeJobHistory).filter(ScrapeJobHistory.user_id == current_user.id)
         
         # Search filter
         if search and search.strip():
@@ -897,7 +998,7 @@ def get_scraping_history(
             query = query.filter(ScrapeJobHistory.status == status.lower())
 
         # Calculate summary statistics across all history
-        all_histories = db.query(ScrapeJobHistory).all()
+        all_histories = db.query(ScrapeJobHistory).filter(ScrapeJobHistory.user_id == current_user.id).all()
         total_jobs = len(all_histories)
         total_students_scraped = sum(h.processed_students for h in all_histories)
         total_passed = sum(h.passed_count for h in all_histories)
@@ -963,12 +1064,12 @@ def get_scraping_history(
 def clear_all_history(current_user: User = Depends(get_current_user)):
     db = SessionLocal()
     try:
-        db.query(ScrapeJobHistory).delete()
+        db.query(ScrapeJobHistory).filter(ScrapeJobHistory.user_id == current_user.id).delete(synchronize_session=False)
         db.commit()
         return {"message": "All scraping history cleared successfully."}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to clear history: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to clear history.")
     finally:
         db.close()
 
@@ -977,7 +1078,10 @@ def clear_all_history(current_user: User = Depends(get_current_user)):
 def delete_history_item(history_id: int, current_user: User = Depends(get_current_user)):
     db = SessionLocal()
     try:
-        item = db.query(ScrapeJobHistory).filter(ScrapeJobHistory.id == history_id).first()
+        item = db.query(ScrapeJobHistory).filter(
+            ScrapeJobHistory.id == history_id,
+            ScrapeJobHistory.user_id == current_user.id
+        ).first()
         if not item:
             raise HTTPException(status_code=404, detail="History record not found.")
         db.delete(item)
@@ -987,55 +1091,84 @@ def delete_history_item(history_id: int, current_user: User = Depends(get_curren
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to delete history record: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete history record.")
     finally:
         db.close()
 
 
 @app.get("/api/scrape/download")
-def download_excel_file(path: str):
-    base_name = os.path.basename(path)
+def download_excel_file(
+    job_id: Optional[str] = None,
+    path: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    if not job_id and not path:
+        raise HTTPException(status_code=400, detail="A scrape job ID is required.")
+
+    db = SessionLocal()
+    try:
+        job = None
+        history = None
+        if job_id:
+            job = db.query(ScrapeJob).filter(
+                ScrapeJob.job_id == job_id,
+                ScrapeJob.user_id == current_user.id
+            ).first()
+            if not job:
+                history = db.query(ScrapeJobHistory).filter(
+                    ScrapeJobHistory.job_id == job_id,
+                    ScrapeJobHistory.user_id == current_user.id
+                ).first()
+        else:
+            job = db.query(ScrapeJob).filter(
+                ScrapeJob.user_id == current_user.id,
+                ScrapeJob.excel_file_path == path
+            ).first()
+            if not job:
+                history = db.query(ScrapeJobHistory).filter(
+                    ScrapeJobHistory.user_id == current_user.id,
+                    ScrapeJobHistory.excel_file_path == path
+                ).first()
+        stored_path = (job.excel_file_path if job else history.excel_file_path if history else None)
+    finally:
+        db.close()
+
+    if not stored_path:
+        raise HTTPException(status_code=404, detail="Scrape job or output not found.")
+    full_path = os.path.realpath(stored_path)
+    user_root = os.path.realpath(user_job_directory(current_user.id))
+    if os.path.commonpath([user_root, full_path]) != user_root:
+        raise HTTPException(status_code=404, detail="Scrape output not found.")
+    base_name = os.path.basename(full_path)
     if not base_name.endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Invalid file extension. Only Excel files are supported.")
-    
-    # Ensure file exists in data directory
-    full_path = os.path.join("data", base_name)
-    if not os.path.exists(full_path):
-        # Try fallback relative to script parent directory
-        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        fallback_path = os.path.join(script_dir, "data", base_name)
-        if os.path.exists(fallback_path):
-            full_path = fallback_path
-        else:
-            raise HTTPException(status_code=404, detail="Requested Excel file was not found.")
-    
+    if not os.path.isfile(full_path):
+        raise HTTPException(status_code=404, detail="Requested Excel file was not found.")
+
     return FileResponse(
         path=full_path, 
         filename=base_name, 
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-def find_student_record(enrollment: str) -> Optional[Dict[str, Any]]:
-    """Helper to locate a student's parsed result record across active session or saved Excel files."""
+def find_student_record(enrollment: str, user_id: int) -> Optional[Dict[str, Any]]:
+    """Locate a student result only in the authenticated user's jobs and files."""
     enrollment = enrollment.strip().upper()
 
-    # 1. Search in active runner records or last job status
-    global active_runner, last_job_status
-    if active_runner and active_runner.records:
-        for r in active_runner.records:
-            if str(r.get("enrollment", "")).upper() == enrollment:
-                return r
+    with runner_lock:
+        active_runners = list(scrape_runners.values())
+    for runner in active_runners:
+        if runner.user_id == user_id:
+            for record in runner.records:
+                if str(record.get("enrollment", "")).upper() == enrollment:
+                    return record
 
-    if last_job_status and last_job_status.get("records"):
-        for r in last_job_status["records"]:
-            if str(r.get("enrollment", "")).upper() == enrollment:
-                return r
-
-    # 2. Search in saved Excel files in data/ and data/uploads/
+    # Search only files stored under the authenticated user's directory.
     import glob
     from openpyxl import load_workbook
 
-    excel_files = glob.glob("data/*.xlsx") + glob.glob("data/uploads/*.xlsx")
+    user_root = user_job_directory(user_id)
+    excel_files = glob.glob(os.path.join(user_root, "**", "*.xlsx"), recursive=True)
     for filepath in excel_files:
         try:
             wb = load_workbook(filename=filepath, read_only=True, data_only=True)
@@ -1093,24 +1226,20 @@ def find_student_record(enrollment: str) -> Optional[Dict[str, Any]]:
 
 
 @app.get("/api/scrape/download_pdf")
-def download_marksheet_pdf(enrollment: str):
+def download_marksheet_pdf(enrollment: str, current_user: User = Depends(get_current_user)):
     if not enrollment:
         raise HTTPException(status_code=400, detail="Enrollment number is required.")
 
     enrollment_clean = enrollment.strip().upper()
     filename = f"{enrollment_clean}.pdf"
 
-    # 1. Check if PDF file already exists on disk
-    full_path = os.path.abspath(os.path.join("data", "marksheets", filename))
-    if not os.path.exists(full_path):
-        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        fallback_path = os.path.join(script_dir, "data", "marksheets", filename)
-        if os.path.exists(fallback_path):
-            full_path = fallback_path
+    marksheet_dir = os.path.join(user_job_directory(current_user.id), "marksheets")
+    os.makedirs(marksheet_dir, exist_ok=True)
+    full_path = os.path.join(marksheet_dir, filename)
 
     # 2. If PDF does not exist on disk, generate on-demand from stored database/Excel records
     if not os.path.exists(full_path):
-        record = find_student_record(enrollment_clean)
+        record = find_student_record(enrollment_clean, current_user.id)
         if not record:
             raise HTTPException(
                 status_code=404,
@@ -1120,10 +1249,10 @@ def download_marksheet_pdf(enrollment: str):
         try:
             from report_generator.marksheet_pdf import generate_student_marksheet_pdf
             full_path = generate_student_marksheet_pdf(record, full_path)
-            print(f"[On-Demand PDF] Successfully generated marksheet for {enrollment_clean}: {full_path}")
+            print(f"[On-Demand PDF] Generated marksheet for owner {current_user.id}.")
         except Exception as e:
-            print(f"[On-Demand PDF Error] Failed to generate marksheet for {enrollment_clean}: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to generate marksheet PDF: {str(e)}")
+            print(f"[On-Demand PDF Error] Failed for owner {current_user.id}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to generate marksheet PDF.")
 
     return FileResponse(
         path=full_path,
@@ -1138,7 +1267,10 @@ async def broadcast_updates():
         while not update_queue.empty():
             try:
                 message = update_queue.get_nowait()
-                await manager.broadcast(message)
+                user_id = message.get("user_id")
+                job_id = message.get("job_id")
+                if user_id is not None and job_id:
+                    await manager.send_to_owner(user_id, job_id, message)
             except queue.Empty:
                 break
         await asyncio.sleep(0.15)
@@ -1147,34 +1279,43 @@ async def broadcast_updates():
 # WebSocket endpoint
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-    # Send initial status
-    global active_runner, last_job_status
-    if active_runner:
-        await websocket.send_json({"type": "status", "data": active_runner.get_status_dict()})
-    elif last_job_status:
-        await websocket.send_json({"type": "status", "data": last_job_status})
-    else:
-        await websocket.send_json({"type": "status", "data": {
-            "status": "idle",
-            "total": 0,
-            "processed": 0,
-            "pass_count": 0,
-            "fail_count": 0,
-            "not_found_count": 0,
-            "error_count": 0,
-            "current_enrollment": "",
-            "excel_file_path": None,
-            "validation_report": None,
-            "records": [],
-            "logs": []
-        }})
-        
+    protocols = websocket.scope.get("subprotocols", [])
+    if len(protocols) < 2 or protocols[0] != "resultai":
+        await websocket.close(code=4401)
+        return
     try:
+        payload = decode_token(protocols[1], SECRET_KEY)
+        user_id = int(payload.get("sub"))
+        if payload.get("type") != "access":
+            raise ValueError("Invalid token type")
+    except Exception:
+        await websocket.close(code=4401)
+        return
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id, User.is_active.is_(True)).first()
+    finally:
+        db.close()
+    if not user:
+        await websocket.close(code=4401)
+        return
+
+    job_id = websocket.query_params.get("job_id")
+    if job_id and not get_owned_job_row(user_id, job_id):
+        await websocket.close(code=4404)
+        return
+
+    try:
+        await manager.connect(websocket, user_id, job_id)
+        status = get_user_job_status(user_id, job_id)
+        await websocket.send_json({"type": "status", "data": status})
         while True:
             # Keep connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
+        pass
+    finally:
         manager.disconnect(websocket)
 
 

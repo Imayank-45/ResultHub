@@ -1,68 +1,58 @@
-import sys
-import os
-import json
+from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from backend.server import app, update_queue, ScrapeJobRunner, active_runner
+import backend.server as server
+from backend.server import ScrapeJobRunner
 from backend.support_router import handle_support_chat, SupportChatRequest
 
-print("=" * 65)
-print("   TESTING REAL-TIME SYNCHRONIZATION ARCHITECTURE")
-print("=" * 65)
 
-# Test 1: Verify enriched status payload schema
-runner = ScrapeJobRunner(
-    prefix="0105IT2410",
-    start=1,
-    end=5,
-    pad=2,
-    sem="3",
-    program="B.Tech."
-)
+def test_scrape_runner_status_contains_job_identity():
+    runner = ScrapeJobRunner(
+        prefix="0105IT2410",
+        start=1,
+        end=5,
+        pad=2,
+        sem="3",
+        program="B.Tech.",
+        user_id=42,
+        job_id="JOB-test-sync",
+    )
 
-status_dict = runner.get_status_dict()
-print("\n[TEST 1] Single Source of Truth Status Payload:")
-print(f"  Job ID       : {status_dict.get('job_id')}")
-print(f"  Prefix       : {status_dict.get('prefix')}")
-print(f"  Roll Range   : {status_dict.get('start')} to {status_dict.get('end')}")
-print(f"  Program/Sem  : {status_dict.get('program')} / Sem {status_dict.get('sem')}")
-print(f"  Status       : {status_dict.get('status')}")
+    status = runner.get_status_dict()
+    assert status["prefix"] == "0105IT2410"
+    assert status["start"] == 1
+    assert status["end"] == 5
+    assert status["job_id"] == "JOB-test-sync"
 
-assert status_dict.get("prefix") == "0105IT2410"
-assert status_dict.get("start") == 1
-assert status_dict.get("end") == 5
-assert status_dict.get("job_id") is not None
 
-# Test 2: Chatbot START_EXTRACTION triggers runner & emits WebSocket payload
-req = SupportChatRequest(
-    messages=[],
-    user_query="1 se 5 tak result nikal IT, third sem BTech ka"
-)
+def test_support_chat_starts_job_for_authenticated_user(monkeypatch):
+    runner = ScrapeJobRunner(
+        prefix="0105IT2410",
+        start=1,
+        end=5,
+        pad=2,
+        sem="3",
+        program="B.Tech.",
+        user_id=42,
+        job_id="JOB-support-test",
+    )
+    started_users = []
 
-resp = handle_support_chat(req)
+    def fake_start_job(user_id, **runner_args):
+        started_users.append(user_id)
+        return runner, runner.get_status_dict()
 
-print("\n[TEST 2] Chatbot Extraction Trigger & Broadcast:")
-print(f"  Intent: {resp.intent} | Source: {resp.source}")
+    monkeypatch.setattr(server, "start_user_scrape_job", fake_start_job)
+    monkeypatch.setattr(
+        "backend.support_router.get_live_job_context",
+        lambda user_id: runner.get_status_dict() if user_id == 42 else None,
+    )
 
-assert resp.intent == "START_EXTRACTION"
+    request = SupportChatRequest(
+        messages=[],
+        user_query="1 se 5 tak result nikal IT, third sem BTech ka",
+    )
+    response = handle_support_chat(request, current_user=SimpleNamespace(id=42))
 
-# Check update_queue for emitted WebSocket broadcast message
-broadcast_msg = None
-while not update_queue.empty():
-    msg = update_queue.get_nowait()
-    if msg.get("type") == "status":
-        broadcast_msg = msg.get("data")
-        break
-
-assert broadcast_msg is not None, "WebSocket update_queue must receive status broadcast"
-print("\n[TEST 3] WebSocket Broadcast Data Received:")
-print(f"  Prefix       : {broadcast_msg.get('prefix')}")
-print(f"  Start Roll   : {broadcast_msg.get('start')}")
-print(f"  End Roll     : {broadcast_msg.get('end')}")
-print(f"  Status       : {broadcast_msg.get('status')}")
-assert broadcast_msg.get("prefix") == "0105IT2410"
-
-print("\n" + "=" * 65)
-print("   REAL-TIME SYNCHRONIZATION TEST PASSED SUCCESSFULLY!  ")
-print("=" * 65)
+    assert response.intent == "START_EXTRACTION"
+    assert response.job_id == runner.job_id
+    assert started_users == [42]

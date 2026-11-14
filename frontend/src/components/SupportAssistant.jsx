@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuth, API_BASE } from '../context/AuthContext';
 
-const STORAGE_KEY = 'resultai_support_chats_v1';
+const STORAGE_KEY_PREFIX = 'resultai_support_chats_v1';
 
 function getFormattedTimestamp(dateObj = new Date()) {
   try {
@@ -167,18 +167,17 @@ function renderInlineFormatting(text) {
 
 // Real-Time Scraping Progress Card for Chatbot Stream
 function LiveScrapingCard({ message, currentJobState, onStopJob }) {
-  const { authFetch, isAuthenticated } = useAuth();
+  const { authFetch, isAuthenticated, user } = useAuth();
   const [fetchedData, setFetchedData] = useState(null);
-  const [tick, setTick] = useState(0);
+  const [, setTick] = useState(0);
+  const ownerIdRef = useRef(user?.id ?? null);
+  ownerIdRef.current = user?.id ?? null;
 
   const banner = message?.live_job_banner || message?.job_info || {};
-  const targetJobId = message?.job_id || banner?.job_id || 'JOB-1787111890';
+  const targetJobId = message?.job_id || banner?.job_id || null;
 
   // Match live active job from WebSocket / Polling
-  const isMatchingJob = currentJobState && (
-    currentJobState.job_id === targetJobId ||
-    (currentJobState.status !== 'idle' && currentJobState.total > 0)
-  );
+  const isMatchingJob = currentJobState && targetJobId && currentJobState.job_id === targetJobId;
 
   const activeJob = fetchedData || (isMatchingJob ? currentJobState : null);
   const jobData = {
@@ -198,23 +197,47 @@ function LiveScrapingCard({ message, currentJobState, onStopJob }) {
   // 1-second interval ticker & status polling while active
   useEffect(() => {
     if (isCompleted || isFailed || isCancelled) return;
+    let disposed = false;
+    const ownerId = user?.id ?? null;
 
-    const timer = setInterval(() => {
+    const fetchStatus = async () => {
       setTick((t) => t + 1);
+      if (!isAuthenticated || !jobId) return;
+      try {
+        const res = await authFetch(`${API_BASE}/scrape/status?job_id=${encodeURIComponent(jobId)}`);
+        if (!res.ok || disposed || Number(ownerIdRef.current) !== Number(ownerId)) return;
+        const data = await res.json();
+        if (!disposed && Number(ownerIdRef.current) === Number(ownerId) && data.job_id === jobId) {
+          setFetchedData(data);
+        }
+      } catch {
+        // The dashboard status poller remains the recovery source while the network is unavailable.
+      }
+    };
 
-      const fetchFn = (isAuthenticated && authFetch) ? authFetch : fetch;
-      fetchFn(`${API_BASE}/scrape/status`)
-        .then((res) => (res.ok ? res.json() : null))
-        .then((data) => {
-          if (data && data.status) {
-            setFetchedData(data);
-          }
-        })
-        .catch(() => {});
-    }, 1000);
+    fetchStatus();
+    const timer = setInterval(fetchStatus, 1000);
 
-    return () => clearInterval(timer);
-  }, [isRunning, isPaused, isCompleted, isFailed, isCancelled, isAuthenticated, authFetch]);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
+  }, [jobId, isRunning, isPaused, isCompleted, isFailed, isCancelled, isAuthenticated, authFetch, user?.id]);
+
+  const downloadExcel = async () => {
+    if (!jobId) return;
+    const ownerId = user?.id ?? null;
+    const response = await authFetch(`${API_BASE}/scrape/download?job_id=${encodeURIComponent(jobId)}`);
+    if (!response.ok) throw new Error('Failed to download scrape output.');
+    const blob = await response.blob();
+    if (Number(ownerIdRef.current) !== Number(ownerId)) return;
+    const objectUrl = window.URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = `RGPV_Result_${jobId}.xlsx`;
+    anchor.click();
+    window.URL.revokeObjectURL(objectUrl);
+  };
 
   // Overall status label
   const statusLabel = isRunning
@@ -359,10 +382,9 @@ function LiveScrapingCard({ message, currentJobState, onStopJob }) {
 
           {excelPath && (
             <div style={{ marginTop: '6px' }}>
-              <a
-                href={`${API_BASE}/scrape/download?path=${encodeURIComponent(excelPath)}`}
-                target="_blank"
-                rel="noopener noreferrer"
+              <button
+                type="button"
+                onClick={() => downloadExcel().catch(err => console.error(err))}
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -376,12 +398,14 @@ function LiveScrapingCard({ message, currentJobState, onStopJob }) {
                   fontWeight: '800',
                   fontSize: '12px',
                   textDecoration: 'none',
+                  border: 0,
+                  cursor: 'pointer',
                   boxShadow: '0 4px 14px rgba(16, 185, 129, 0.4)',
                   transition: 'all 0.2s ease'
                 }}
               >
                 📥 Download Excel
-              </a>
+              </button>
             </div>
           )}
         </div>
@@ -467,14 +491,16 @@ function LiveScrapingCard({ message, currentJobState, onStopJob }) {
               <button
                 onClick={async (e) => {
                   e.stopPropagation();
+                  const ownerId = user?.id ?? null;
                   setFetchedData(prev => ({ ...(prev || {}), status: 'cancelled' }));
                   try {
-                    const activeToken = localStorage.getItem('access_token') || sessionStorage.getItem('access_token');
-                    const headers = activeToken ? { 'Authorization': `Bearer ${activeToken}` } : {};
-                    await fetch(`${API_BASE}/scrape/cancel`, { method: 'POST', headers });
+                    const response = await authFetch(`${API_BASE}/scrape/cancel?job_id=${encodeURIComponent(jobId)}`, { method: 'POST' });
+                    if (!response.ok || Number(ownerIdRef.current) !== Number(ownerId)) return;
                   } catch (err) {
                     console.error("Error stopping scrape:", err);
+                    return;
                   }
+                  if (Number(ownerIdRef.current) !== Number(ownerId)) return;
                   if (onStopJob) {
                     onStopJob();
                   }
@@ -509,7 +535,8 @@ function LiveScrapingCard({ message, currentJobState, onStopJob }) {
 }
 
 export default function SupportAssistant({ jobState }) {
-  const { authFetch, isAuthenticated } = useAuth();
+  const { authFetch, isAuthenticated, user } = useAuth();
+  const storageKey = `${STORAGE_KEY_PREFIX}:${user?.id ?? 'signed-out'}`;
   const [isOpen, setIsOpen] = useState(false);
   const [showDrawer, setShowDrawer] = useState(false);
   const [showConfirmClearModal, setShowConfirmClearModal] = useState(false);
@@ -517,7 +544,7 @@ export default function SupportAssistant({ jobState }) {
   // Persistent Chats State
   const [conversations, setConversations] = useState(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
+      const saved = localStorage.getItem(storageKey);
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
@@ -529,6 +556,9 @@ export default function SupportAssistant({ jobState }) {
     }
     return [createNewChatObject('Welcome Chat')];
   });
+  const [conversationOwnerId, setConversationOwnerId] = useState(user?.id ?? null);
+  const currentUserIdRef = useRef(user?.id ?? null);
+  currentUserIdRef.current = user?.id ?? null;
 
   const [activeChatId, setActiveChatId] = useState(() => {
     return conversations[0]?.id || null;
@@ -553,14 +583,33 @@ export default function SupportAssistant({ jobState }) {
 
   const messagesEndRef = useRef(null);
 
+  useEffect(() => {
+    const nextOwnerId = user?.id ?? null;
+    if (conversationOwnerId === nextOwnerId) return;
+    let restored = [];
+    try {
+      const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}:${nextOwnerId ?? 'signed-out'}`);
+      const parsed = saved ? JSON.parse(saved) : [];
+      if (Array.isArray(parsed)) restored = parsed;
+    } catch (e) {
+      console.error('Failed to load account chat history', e);
+    }
+    const nextConversations = restored.length ? restored : [createNewChatObject('Welcome Chat')];
+    setConversations(nextConversations);
+    setActiveChatId(nextConversations[0]?.id || null);
+    setConversationOwnerId(nextOwnerId);
+  }, [user?.id, conversationOwnerId]);
+
   // Save conversations to localStorage whenever they change
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
+      if (conversationOwnerId === (user?.id ?? null)) {
+        localStorage.setItem(storageKey, JSON.stringify(conversations));
+      }
     } catch (e) {
       console.error("Failed to save chat history to localStorage", e);
     }
-  }, [conversations]);
+  }, [conversations, storageKey, conversationOwnerId, user?.id]);
 
   // Current Active Conversation
   const activeConversation = conversations.find((c) => c.id === activeChatId) || conversations[0];
@@ -581,10 +630,9 @@ export default function SupportAssistant({ jobState }) {
   const [liveJobState, setLiveJobState] = useState(jobState || null);
 
   useEffect(() => {
-    if (jobState) {
-      setLiveJobState(jobState);
-    }
-  }, [jobState]);
+    if (jobState?.owner_id === user?.id) setLiveJobState(jobState);
+    else setLiveJobState(null);
+  }, [jobState, user?.id]);
 
   // Fetch FAQ quick prompts on load
   useEffect(() => {
@@ -603,12 +651,13 @@ export default function SupportAssistant({ jobState }) {
   useEffect(() => {
     if (isOpen) {
       const fetchFn = (isAuthenticated && authFetch) ? authFetch : fetch;
-      fetchFn(`${API_BASE}/scrape/status`)
+      const statusQuery = liveJobState?.job_id ? `?job_id=${encodeURIComponent(liveJobState.job_id)}` : '';
+      fetchFn(`${API_BASE}/scrape/status${statusQuery}`)
         .then(res => res.ok ? res.json() : null)
-        .then(data => { if (data) setLiveJobState(data); })
+        .then(data => { if (data && (!liveJobState?.job_id || data.job_id === liveJobState.job_id)) setLiveJobState(data); })
         .catch(() => {});
     }
-  }, [isOpen, isAuthenticated, authFetch]);
+  }, [isOpen, isAuthenticated, authFetch, liveJobState?.job_id]);
 
   // Highlight badge when scrape fails or completes
   useEffect(() => {
@@ -633,6 +682,8 @@ export default function SupportAssistant({ jobState }) {
   const handleSendMessage = async (textToSend) => {
     const query = (textToSend || inputQuery).trim();
     if (!query || isTyping) return;
+    const ownerId = user?.id ?? null;
+    const chatId = activeChatId;
 
     const userTimestamp = getFormattedTimestamp();
     const userMsg = { role: 'user', content: query, timestamp: userTimestamp };
@@ -677,6 +728,7 @@ export default function SupportAssistant({ jobState }) {
       }
 
       const data = await response.json();
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       const assistantTimestamp = getFormattedTimestamp();
       const assistantMsg = {
         role: 'assistant',
@@ -691,12 +743,13 @@ export default function SupportAssistant({ jobState }) {
 
       setConversations((prev) =>
         prev.map((c) =>
-          c.id === activeChatId
+          c.id === chatId
             ? { ...c, updatedAt: Date.now(), messages: [...c.messages, assistantMsg] }
             : c
         )
       );
-    } catch (err) {
+    } catch {
+      if (Number(currentUserIdRef.current) !== Number(ownerId)) return;
       const assistantTimestamp = getFormattedTimestamp();
       const fallbackMsg = {
         role: 'assistant',
@@ -709,7 +762,7 @@ export default function SupportAssistant({ jobState }) {
 
       setConversations((prev) =>
         prev.map((c) =>
-          c.id === activeChatId
+          c.id === chatId
             ? { ...c, updatedAt: Date.now(), messages: [...c.messages, fallbackMsg] }
             : c
         )

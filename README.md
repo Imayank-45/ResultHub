@@ -165,6 +165,26 @@ PORT=8000
 HOST=127.0.0.1
 ```
 
+### Railway Deployment
+
+The root `Dockerfile` is the Railway deployment entry point and starts one Uvicorn process. Configure these service variables:
+
+- `DATABASE_URL`: Railway PostgreSQL connection URL is recommended. SQLite requires a persistent volume mounted at `/app/data`.
+- `JWT_SECRET_KEY` and `JWT_REFRESH_SECRET_KEY`: set independent, long random secrets; do not use the development defaults shown by the application.
+- `PORT`: supplied by Railway and consumed by the Docker command.
+- `VITE_FEEDBACK_API_URL`: optional; only needed to forward feedback to the configured Apps Script endpoint.
+
+Safe rollout order for an existing database:
+
+1. Back up the Railway PostgreSQL database (and any persistent generated-data volume).
+2. Run `python -m scripts.migrate_scrape_job_indexes` as a Railway one-off command using this release image and the production `DATABASE_URL`.
+3. Deploy the application image with one replica and one Uvicorn worker.
+4. Smoke-test login, scrape start/status, the job-scoped WebSocket, history, and authenticated downloads.
+
+The migration is additive and idempotent. For rollback, redeploy the previous image and leave the new indexes in place; do not delete/recreate the database or generated-data volume.
+
+Railway's proxy must allow WebSocket upgrades on the same public host; HTTPS clients connect with `wss://`. Keep the service at one replica and one Uvicorn worker. Job runners, cancellation controls, the progress queue, and WebSocket connections are process-local; multiple replicas or `--workers` would split job control and event delivery. No Redis is configured or required for the current single-process deployment. Multi-worker scaling requires a shared job queue and event broker first.
+
 ---
 
 ## 🚀 Usage Guide & Application Workflow
@@ -305,9 +325,20 @@ RESULT_AI/
 
 ## ⚠️ Known Limitations & Notes
 
-1. **Single Active Scraper Lock:** The system enforces a single active scraper job per server node to prevent IP blocking by the RGPV result portal.
-2. **ASP.NET Selector Dependencies:** Web extraction relies on RGPV portal DOM structures (`#ctl00_ContentPlaceHolder1_...`).
-3. **Headless OCR Mode:** Uses local `ddddocr` engine in headless mode for reliable CAPTCHA solving.
+1. **Scraper Job Isolation:** Scrape jobs, status, history, and output ownership are scoped to the authenticated user. Multiple jobs can run concurrently in one server process.
+2. **Single-Process Job Execution:** Runner objects and WebSocket connections are process-local. Deploy one backend worker/instance for scraping until a shared task queue and event broker are configured; other workers cannot control or receive events from a job started elsewhere.
+3. **ASP.NET Selector Dependencies:** Web extraction relies on RGPV portal DOM structures (`#ctl00_ContentPlaceHolder1_...`).
+4. **Headless OCR Mode:** Uses local `ddddocr` engine in headless mode for reliable CAPTCHA solving.
+
+### Scrape Job Database Index Migration
+
+Existing deployments can add the non-destructive user/job lookup indexes after deploying this version:
+
+```bash
+python -m scripts.migrate_scrape_job_indexes
+```
+
+The migration only creates indexes and skips missing tables; it does not alter or delete user or history rows. New databases receive the same indexes through SQLAlchemy table creation.
 
 ---
 

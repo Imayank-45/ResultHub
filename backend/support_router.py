@@ -115,14 +115,12 @@ def extract_student_name(raw_query: str, norm_text: str) -> Tuple[Optional[str],
 #  LIVE JOB CONTEXT & BANNER
 # ═══════════════════════════════════════════════════════════════════════
 
-def get_live_job_context() -> Optional[Dict[str, Any]]:
-    """Reads active job status directly from server module safely."""
+def get_live_job_context(user_id: int) -> Optional[Dict[str, Any]]:
+    """Returns the latest job status owned by the authenticated user."""
     try:
-        from backend.server import active_runner, last_job_status
-        if active_runner:
-            return active_runner.get_status_dict()
-        elif last_job_status:
-            return last_job_status
+        from backend.server import get_user_job_status
+        status = get_user_job_status(user_id)
+        return status if status.get("job_id") else None
     except Exception as e:
         print(f"[SupportAssistant] Error reading live job context: {e}")
     return None
@@ -161,7 +159,7 @@ def format_job_banner(job_info: Optional[Dict[str, Any]]) -> Optional[Dict[str, 
 #  STUDENT RESULT SEARCH ENGINE
 # ═══════════════════════════════════════════════════════════════════════
 
-def search_student_records(query: str, semester_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+def search_student_records(query: str, user_id: int, semester_filter: Optional[str] = None) -> List[Dict[str, Any]]:
     """Searches for student result records in active memory and saved Excel files in data/."""
     clean_q = query.strip().upper()
     if not clean_q:
@@ -171,7 +169,7 @@ def search_student_records(query: str, semester_filter: Optional[str] = None) ->
     seen_enrollments = set()
 
     # 1. Search Active Job Runner in-memory records
-    job_info = get_live_job_context()
+    job_info = get_live_job_context(user_id)
     if job_info and "records" in job_info and job_info["records"]:
         sem_context = job_info.get("sem") or semester_filter or ""
         program_context = job_info.get("program") or "B.Tech."
@@ -199,7 +197,9 @@ def search_student_records(query: str, semester_filter: Optional[str] = None) ->
                     })
 
     # 2. Search saved Excel files in data/ and data/uploads/
-    excel_files = glob.glob("data/*.xlsx") + glob.glob("data/uploads/*.xlsx")
+    from backend.server import user_job_directory
+    user_data_dir = user_job_directory(user_id)
+    excel_files = glob.glob(os.path.join(user_data_dir, "**", "*.xlsx"), recursive=True)
     for fpath in excel_files:
         try:
             wb = load_workbook(fpath, read_only=True, data_only=True)
@@ -485,7 +485,7 @@ def log_nlp_pipeline_debug(raw_query: str, norm_text: str, intent: str, confiden
 #  ACTION HANDLERS
 # ═══════════════════════════════════════════════════════════════════════
 
-def execute_result_lookup(entities: Dict[str, Any], raw_query: str) -> Dict[str, Any]:
+def execute_result_lookup(entities: Dict[str, Any], raw_query: str, user_id: int) -> Dict[str, Any]:
     """Handles student result lookup, multi-student disambiguation, and result card generation."""
     roll = entities.get("roll_number")
     name = entities.get("student_name")
@@ -500,7 +500,7 @@ def execute_result_lookup(entities: Dict[str, Any], raw_query: str) -> Dict[str,
             "suggested_actions": ["⚡ Check Live Scrape Status", "📜 View History", "❓ Capabilities"]
         }
 
-    matches = search_student_records(target_query, semester_filter=sem)
+    matches = search_student_records(target_query, user_id, semester_filter=sem)
 
     if not matches:
         return {
@@ -555,10 +555,10 @@ def execute_result_lookup(entities: Dict[str, Any], raw_query: str) -> Dict[str,
     }
 
 
-def execute_roll_search(entities: Dict[str, Any], raw_query: str) -> Dict[str, Any]:
+def execute_roll_search(entities: Dict[str, Any], raw_query: str, user_id: int) -> Dict[str, Any]:
     """Handles ROLL_SEARCH queries like 'Ayush ka roll number' and returns matching enrollment numbers."""
     name = entities.get("student_name") or raw_query.strip()
-    matches = search_student_records(name)
+    matches = search_student_records(name, user_id)
 
     if not matches:
         return {
@@ -577,15 +577,15 @@ def execute_roll_search(entities: Dict[str, Any], raw_query: str) -> Dict[str, A
     }
 
 
-def inspect_existing_records(prefix: str, start_roll: int, end_roll: int, pad: int = 2) -> Dict[str, Any]:
-    """Inspects existing records in active memory and data/*.xlsx for rolls in range [start_roll, end_roll]."""
+def inspect_existing_records(prefix: str, start_roll: int, end_roll: int, user_id: int, pad: int = 2) -> Dict[str, Any]:
+    """Inspects the authenticated user's records for rolls in the requested range."""
     total = max(1, end_roll - start_roll + 1)
     found_records = {}
     missing_rolls = []
 
     for roll in range(start_roll, end_roll + 1):
         enr = f"{prefix}{str(roll).zfill(pad)}"
-        matches = search_student_records(enr)
+        matches = search_student_records(enr, user_id)
         if matches:
             found_records[roll] = matches[0]
         else:
@@ -599,38 +599,31 @@ def inspect_existing_records(prefix: str, start_roll: int, end_roll: int, pad: i
     }
 
 
-def auto_start_scraper_job(prefix: str, start_roll: int, end_roll: int, pad: int = 2, sem: Optional[str] = None, program: str = "B.Tech.") -> Tuple[bool, str, Any]:
-    """Automatically launches ScrapeJobRunner in backend for requested parameters if runner is idle."""
+def auto_start_scraper_job(prefix: str, start_roll: int, end_roll: int, user_id: int, pad: int = 2, sem: Optional[str] = None, program: str = "B.Tech.") -> Tuple[bool, str, Any]:
+    """Launches a scrape job owned by the authenticated user."""
     try:
-        from backend.server import active_runner, runner_lock, ScrapeJobRunner
         import backend.server as server_mod
 
         if start_roll > end_roll:
             return False, "Start roll number must be less than or equal to end roll number.", None
 
-        with runner_lock:
-            if server_mod.active_runner is not None and server_mod.active_runner.status in ["running", "resumed", "starting"]:
-                return False, f"A scraping job is already active in background (Job ID: {server_mod.active_runner.job_id}).", server_mod.active_runner
-
-            runner = ScrapeJobRunner(
-                prefix=prefix,
-                start=start_roll,
-                end=end_roll,
-                pad=pad,
-                sem=sem,
-                program=program,
-                headless=True
-            )
-            runner.start_job()
-            server_mod.active_runner = runner
-            runner.notify_progress()
-            return True, f"Started extraction job for rolls {start_roll} to {end_roll}.", runner
-    except Exception as e:
-        print(f"[SupportAssistant] Auto-start scraper warning: {e}")
-        return False, f"Could not auto-start scraper: {e}", None
+        runner, _ = server_mod.start_user_scrape_job(
+            user_id,
+            prefix=prefix,
+            start=start_roll,
+            end=end_roll,
+            pad=pad,
+            sem=sem,
+            program=program,
+            headless=True
+        )
+        return True, f"Started extraction job for rolls {start_roll} to {end_roll}.", runner
+    except Exception:
+        print("[SupportAssistant] Scrape job could not be started.")
+        return False, "Could not start scraping job due to an internal error.", None
 
 
-def execute_start_extraction(entities: Dict[str, Any]) -> Dict[str, Any]:
+def execute_start_extraction(entities: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     """Handles natural language extraction commands by launching a real backend ScrapeJobRunner."""
     program = entities.get("program", "B.Tech.")
     branch = entities.get("branch", "IT")
@@ -644,6 +637,7 @@ def execute_start_extraction(entities: Dict[str, Any]) -> Dict[str, Any]:
         prefix=prefix,
         start_roll=start,
         end_roll=end,
+        user_id=user_id,
         pad=pad,
         sem=sem,
         program=program
@@ -681,13 +675,19 @@ def execute_start_extraction(entities: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-def execute_cancel_job() -> Dict[str, Any]:
+def execute_cancel_job(user_id: int) -> Dict[str, Any]:
     """Handles CANCEL_JOB intent: stops active background extraction job safely."""
     try:
         import backend.server as server_mod
-        if server_mod.active_runner and server_mod.active_runner.status in ["running", "resumed", "starting", "paused"]:
-            job_id = server_mod.active_runner.job_id
-            server_mod.active_runner.cancel()
+        with server_mod.runner_lock:
+            runner = next((
+                candidate for candidate in server_mod.scrape_runners.values()
+                if candidate.user_id == user_id and candidate.status in ["running", "resumed", "starting", "paused"]
+            ), None)
+            if runner:
+                job_id = runner.job_id
+                runner.cancel()
+        if runner:
             reply = (
                 f"⏹️ **Scraping Job Cancelled**\n\n"
                 f"The active background scraping job (`{job_id}`) has been stopped safely."
@@ -703,18 +703,18 @@ def execute_cancel_job() -> Dict[str, Any]:
                 "reply": "ℹ️ **No Active Scrape Job**: There is currently no active scraping job running to stop.",
                 "suggested_actions": ["🚀 Start New Scrape", "⚡ Check Live Status", "📜 View Scraping History"]
             }
-    except Exception as e:
+    except Exception:
         return {
-            "reply": f"⚠️ **Cancel Request Failed**: {e}",
+            "reply": "⚠️ **Cancel Request Failed**: An internal error occurred.",
             "suggested_actions": ["⚡ Check Live Status", "❓ Capabilities"]
         }
 
 
-def execute_job_stats() -> Dict[str, Any]:
+def execute_job_stats(user_id: int) -> Dict[str, Any]:
     """Handles JOB_STATS intent: queries SQLite database for aggregate job execution counts."""
     db = SessionLocal()
     try:
-        histories = db.query(ScrapeJobHistory).all()
+        histories = db.query(ScrapeJobHistory).filter(ScrapeJobHistory.user_id == user_id).all()
         if not histories:
             return {
                 "reply": "📊 **Scraping Job Statistics**: No extraction jobs have been executed yet in the local database.",
@@ -749,7 +749,7 @@ def execute_job_stats() -> Dict[str, Any]:
         db.close()
 
 
-def execute_total_students(entities: Dict[str, Any]) -> Dict[str, Any]:
+def execute_total_students(entities: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     """Handles TOTAL_STUDENTS intent: returns student count filtered by program/branch/semester."""
     branch = entities.get("branch")
     sem = entities.get("semester")
@@ -763,7 +763,8 @@ def execute_total_students(entities: Dict[str, Any]) -> Dict[str, Any]:
     filter_str = (" (" + ", ".join(filter_desc) + ")") if filter_desc else ""
 
     # Query active runner & Excel files
-    excel_files = glob.glob("data/*.xlsx") + glob.glob("data/uploads/*.xlsx")
+    from backend.server import user_job_directory
+    excel_files = glob.glob(os.path.join(user_job_directory(user_id), "**", "*.xlsx"), recursive=True)
     total_count = 0
     passed_count = 0
     failed_count = 0
@@ -815,9 +816,9 @@ def execute_total_students(entities: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def execute_live_status() -> Dict[str, Any]:
+def execute_live_status(user_id: int) -> Dict[str, Any]:
     """Calculates live scrape status, speed (students/min), and estimated remaining time (ETA)."""
-    job_info = get_live_job_context()
+    job_info = get_live_job_context(user_id)
     if not job_info:
         return {
             "reply": "ℹ️ **No Scrape Job Active**: There is currently no scrape job running. You can start a new extraction from the **Result Extractor** tab.",
@@ -870,11 +871,13 @@ def execute_live_status() -> Dict[str, Any]:
     }
 
 
-def execute_scrape_history() -> Dict[str, Any]:
+def execute_scrape_history(user_id: int) -> Dict[str, Any]:
     """Fetches past jobs from SQLite ScrapeJobHistory database table."""
     db = SessionLocal()
     try:
-        histories = db.query(ScrapeJobHistory).order_by(ScrapeJobHistory.created_at.desc()).limit(5).all()
+        histories = db.query(ScrapeJobHistory).filter(
+            ScrapeJobHistory.user_id == user_id
+        ).order_by(ScrapeJobHistory.created_at.desc()).limit(5).all()
         if not histories:
             return {
                 "reply": "📜 **Scraping History**: No past extraction jobs found in database.",
@@ -885,8 +888,7 @@ def execute_scrape_history() -> Dict[str, Any]:
         for h in histories:
             date_str = h.created_at.strftime("%b %d, %H:%M")
             status_icon = "✅" if h.status == "completed" else ("❌" if h.status == "failed" else "⏸️")
-            dl_link = f" | [📥 Excel](/api/scrape/download?path={h.excel_file_path})" if h.excel_file_path else ""
-            rows_md.append(f"- **{h.job_id}** ({date_str}): Prefix `{h.prefix}` | Sem `{h.sem or 'All'}` | {status_icon} `{h.status}` | Students: **{h.processed_students}/{h.total_students}**{dl_link}")
+            rows_md.append(f"- **{h.job_id}** ({date_str}): Prefix `{h.prefix}` | Sem `{h.sem or 'All'}` | {status_icon} `{h.status}` | Students: **{h.processed_students}/{h.total_students}**")
 
         reply = (
             f"📜 **Recent Scraping History (SQLite Database)**\n\n" +
@@ -902,9 +904,9 @@ def execute_scrape_history() -> Dict[str, Any]:
         db.close()
 
 
-def execute_resume_job() -> Dict[str, Any]:
+def execute_resume_job(user_id: int) -> Dict[str, Any]:
     """Handles job resume trigger guidance and live status check."""
-    job_info = get_live_job_context()
+    job_info = get_live_job_context(user_id)
     if job_info and job_info.get("status") == "paused":
         return {
             "reply": "⏸️ **Job is currently paused**. Click the **Resume Scrape** button on the dashboard header to continue extraction.",
@@ -923,9 +925,9 @@ def execute_resume_job() -> Dict[str, Any]:
     }
 
 
-def execute_export() -> Dict[str, Any]:
+def execute_export(user_id: int) -> Dict[str, Any]:
     """Handles Excel export guidance and download options."""
-    job_info = get_live_job_context()
+    job_info = get_live_job_context(user_id)
     path = job_info.get("excel_file_path") if job_info else None
 
     if path:
@@ -999,7 +1001,7 @@ def get_faq_categories():
 
 
 @support_router.post("/chat", response_model=SupportChatResponse)
-def handle_support_chat(req: SupportChatRequest):
+def handle_support_chat(req: SupportChatRequest, current_user: User = Depends(get_current_user)):
     """
     Main Intent-First Support Chat endpoint.
     1. Detect Intent FIRST
@@ -1026,34 +1028,34 @@ def handle_support_chat(req: SupportChatRequest):
 
         if intent_name == "RESULT_LOOKUP":
             handler_name = "execute_result_lookup"
-            res = execute_result_lookup(entities, user_query)
+            res = execute_result_lookup(entities, user_query, current_user.id)
         elif intent_name == "ROLL_SEARCH":
             handler_name = "execute_roll_search"
-            res = execute_roll_search(entities, user_query)
+            res = execute_roll_search(entities, user_query, current_user.id)
         elif intent_name == "START_EXTRACTION":
             handler_name = "execute_start_extraction"
-            res = execute_start_extraction(entities)
+            res = execute_start_extraction(entities, current_user.id)
         elif intent_name == "JOB_STATS":
             handler_name = "execute_job_stats"
-            res = execute_job_stats()
+            res = execute_job_stats(current_user.id)
         elif intent_name == "TOTAL_STUDENTS":
             handler_name = "execute_total_students"
-            res = execute_total_students(entities)
+            res = execute_total_students(entities, current_user.id)
         elif intent_name == "LIVE_STATUS":
             handler_name = "execute_live_status"
-            res = execute_live_status()
+            res = execute_live_status(current_user.id)
         elif intent_name == "HISTORY":
             handler_name = "execute_scrape_history"
-            res = execute_scrape_history()
+            res = execute_scrape_history(current_user.id)
         elif intent_name == "RESUME":
             handler_name = "execute_resume_job"
-            res = execute_resume_job()
+            res = execute_resume_job(current_user.id)
         elif intent_name == "CANCEL_JOB":
             handler_name = "execute_cancel_job"
-            res = execute_cancel_job()
+            res = execute_cancel_job(current_user.id)
         elif intent_name == "EXPORT":
             handler_name = "execute_export"
-            res = execute_export()
+            res = execute_export(current_user.id)
         elif intent_name == "CAPABILITY":
             handler_name = "execute_capability"
             res = execute_capability()
@@ -1067,7 +1069,7 @@ def handle_support_chat(req: SupportChatRequest):
                 res["suggested_actions"] = ["⚡ Check Live Scrape Status", "🔍 Search Student Result", "❓ Capabilities"]
 
         # Re-evaluate live job context AFTER action handler execution (to capture newly launched jobs)
-        job_info = get_live_job_context()
+        job_info = get_live_job_context(current_user.id)
         live_banner = format_job_banner(job_info)
 
         # Step 4: Enhanced Console Debug Logging
@@ -1087,7 +1089,7 @@ def handle_support_chat(req: SupportChatRequest):
         print(f"[SupportChat Error] Exception during chat handling: {err}")
         import traceback
         traceback.print_exc()
-        job_info = get_live_job_context()
+        job_info = get_live_job_context(current_user.id)
         live_banner = format_job_banner(job_info)
         return SupportChatResponse(
             reply=f"⚠️ **Assistant Handler Notice**: Encountered error processing request: `{err}`",

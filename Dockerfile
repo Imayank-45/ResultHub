@@ -55,6 +55,7 @@ COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 COPY backend/ ./backend
 COPY automation/ ./automation
 COPY report_generator/ ./report_generator
+COPY scripts/ ./scripts
 
 # Install report_generator requirements
 COPY report_generator/requirements.txt ./report_generator/requirements.txt
